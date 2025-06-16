@@ -1,0 +1,37 @@
+# Coinbase Trading Bot Requirements
+# Install these packages with: pip install -r requirements.txt
+
+# Core Coinbase API client
+coinbase-advanced-py>=1.8.0
+
+# Data analysis and manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# HTTP requests (for additional API calls if needed)
+requests>=2.31.0
+
+# Configuration and environment management
+python-dotenv>=1.0.0
+
+# Logging and utilities
+python-dateutil>=2.8.0
+
+# Optional: Enhanced technical analysis
+# ta>=0.10.2
+# TA-Lib>=0.4.24
+
+# Optional: Advanced backtesting
+# backtrader>=1.9.78
+# zipline-reloaded>=2.2.0
+
+# Optional: Real-time data visualization
+# matplotlib>=3.7.0
+# plotly>=5.15.0
+
+# Optional: Database storage
+# sqlalchemy>=2.0.0
+# sqlite3  # Built into Python
+
+# Optional: Telegram notifications
+# python-telegram-bot>=20.0

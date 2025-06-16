@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coinbase Trading Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="dashboard">
+        <!-- Header -->
+        <header class="header">
+            <div class="header__content">
+                <h1 class="header__title">Coinbase Trading Bot Dashboard</h1>
+                <div class="status-indicator">
+                    <div class="status-indicator__dot" id="statusDot"></div>
+                    <span class="status-indicator__text" id="statusText">Running</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Dashboard Grid -->
+        <main class="dashboard-grid">
+            <!-- Status Overview Panel -->
+            <section class="panel status-panel">
+                <h2 class="panel__title">Status Overview</h2>
+                <div class="status-overview">
+                    <div class="status-item">
+                        <label>Trading Pair</label>
+                        <span class="trading-pair">BTC-USDC</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Current Price</label>
+                        <span class="current-price" id="currentPrice">$67,850.32</span>
+                        <span class="price-change positive" id="priceChange">+2.45%</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Bot Status</label>
+                        <span class="status status--success" id="botStatus">Active</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Position</label>
+                        <span class="position long" id="currentPosition">Long</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Account Balance</label>
+                        <span class="balance" id="accountBalance">$5,420.78</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Performance Metrics Panel -->
+            <section class="panel performance-panel">
+                <h2 class="panel__title">Performance Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric">
+                        <label>Total P&L</label>
+                        <span class="metric-value positive" id="totalPnl">$342.56</span>
+                        <span class="metric-percent" id="totalPnlPercent">+6.75%</span>
+                    </div>
+                    <div class="metric">
+                        <label>Win Rate</label>
+                        <span class="metric-value" id="winRate">68.5%</span>
+                    </div>
+                    <div class="metric">
+                        <label>Total Trades</label>
+                        <span class="metric-value" id="totalTrades">47</span>
+                    </div>
+                    <div class="metric">
+                        <label>Daily Trades</label>
+                        <span class="metric-value" id="dailyTrades">3</span>
+                    </div>
+                    <div class="metric">
+                        <label>Best Trade</label>
+                        <span class="metric-value positive" id="bestTrade">$89.23</span>
+                    </div>
+                    <div class="metric">
+                        <label>Current Drawdown</label>
+                        <span class="metric-value negative" id="drawdown">-$12.45</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Technical Indicators Panel -->
+            <section class="panel indicators-panel">
+                <h2 class="panel__title">Technical Indicators</h2>
+                <div class="indicators">
+                    <div class="indicator">
+                        <label>RSI</label>
+                        <div class="rsi-gauge">
+                            <div class="gauge-bar">
+                                <div class="gauge-fill" id="rsiFill"></div>
+                            </div>
+                            <span class="rsi-value" id="rsiValue">42.3</span>
+                        </div>
+                    </div>
+                    <div class="indicator">
+                        <label>Moving Averages</label>
+                        <div class="ma-values">
+                            <span>SMA 12: <span id="sma12">$67,245.67</span></span>
+                            <span>SMA 26: <span id="sma26">$66,980.23</span></span>
+                        </div>
+                    </div>
+                    <div class="indicator">
+                        <label>Bollinger Bands</label>
+                        <div class="bb-values">
+                            <span>Upper: <span id="bbUpper">$68,500.00</span></span>
+                            <span>Middle: <span id="bbMiddle">$67,850.00</span></span>
+                            <span>Lower: <span id="bbLower">$67,200.00</span></span>
+                        </div>
+                    </div>
+                    <div class="indicator">
+                        <label>Current Signal</label>
+                        <span class="signal hold" id="currentSignal">HOLD</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Recent Trades Table -->
+            <section class="panel trades-panel">
+                <h2 class="panel__title">Recent Trades</h2>
+                <div class="trades-table-container">
+                    <table class="trades-table">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Type</th>
+                                <th>Price</th>
+                                <th>Size</th>
+                                <th>P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tradesTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Risk Management Panel -->
+            <section class="panel risk-panel">
+                <h2 class="panel__title">Risk Management</h2>
+                <div class="risk-metrics">
+                    <div class="risk-item">
+                        <label>Risk Exposure</label>
+                        <span class="risk-value" id="riskExposure">2.3%</span>
+                    </div>
+                    <div class="risk-item">
+                        <label>Stop Loss</label>
+                        <span class="risk-value" id="stopLoss">$66,253.81</span>
+                    </div>
+                    <div class="risk-item">
+                        <label>Take Profit</label>
+                        <span class="risk-value" id="takeProfit">$69,807.83</span>
+                    </div>
+                    <div class="risk-item">
+                        <label>Daily Trade Limit</label>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="tradeLimitProgress"></div>
+                        </div>
+                        <span class="progress-text" id="tradeLimitText">3/10</span>
+                    </div>
+                    <div class="risk-item">
+                        <label>Risk per Trade</label>
+                        <span class="risk-value" id="riskPerTrade">1.5%</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Controls Panel -->
+            <section class="panel controls-panel">
+                <h2 class="panel__title">Bot Controls</h2>
+                <div class="controls">
+                    <button class="btn btn--primary" id="toggleBot">Stop Bot</button>
+                    <button class="btn btn--secondary emergency-btn" id="emergencyStop">Emergency Stop</button>
+                    <button class="btn btn--outline" id="settings">Settings</button>
+                    <button class="btn btn--outline" id="exportData">Export Data</button>
+                </div>
+            </section>
+
+            <!-- Live Chart Area -->
+            <section class="panel chart-panel">
+                <h2 class="panel__title">Price Chart</h2>
+                <div class="chart-container">
+                    <canvas id="priceChart"></canvas>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

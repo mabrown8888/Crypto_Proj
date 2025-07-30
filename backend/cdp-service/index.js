@@ -14,20 +14,20 @@ const apiKeyName = process.env.COINBASE_API_KEY;
 const privateKey = process.env.COINBASE_API_SECRET;
 
 let coinbase;
-let defaultWallet;
+let portfolio;
 
 // Initialize CDP client
 async function initializeCDP() {
     try {
         coinbase = new Coinbase({
             apiKeyName: apiKeyName,
-            privateKey: privateKey
+            privateKey: privateKey,
         });
-        
         console.log('CDP client initialized successfully');
-        
-        // Note: Wallet creation will be done on-demand for now
-        console.log('CDP client ready. Wallets will be created on-demand.');
+
+        // The API is portfolio-centric. We'll use the portfolio object for operations.
+        portfolio = coinbase.portfolio;
+        console.log('Portfolio access configured.');
         
     } catch (error) {
         console.error('Failed to initialize CDP client:', error);
@@ -39,24 +39,25 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         cdp_initialized: !!coinbase,
-        wallet_available: !!defaultWallet 
+        portfolio_available: !!portfolio
     });
 });
 
-// Get wallet balances
-app.get('/wallet/balances', async (req, res) => {
+// Get portfolio balances
+app.get('/portfolio/balances', async (req, res) => {
     try {
-        if (!defaultWallet) {
+        if (!portfolio) {
             return res.status(400).json({
                 success: false,
-                error: 'No wallet available'
+                error: 'Portfolio not available'
             });
         }
         
-        const balances = await defaultWallet.listBalances();
+        const portfolioId = process.env.COINBASE_PORTFOLIO_ID;
+        const balances = await portfolio.getBalances(portfolioId);
         res.json({
             success: true,
-            balances: balances
+            balances: balances.balances
         });
         
     } catch (error) {
@@ -71,91 +72,54 @@ app.get('/wallet/balances', async (req, res) => {
 // Execute trade
 app.post('/trade', async (req, res) => {
     try {
-        const { action, amount, fromAsset, toAsset } = req.body;
+        const { side, amount, product_id } = req.body; // side: 'BUY' or 'SELL', product_id: e.g., 'BTC-USD'
         
-        if (!defaultWallet) {
+        if (!portfolio) {
             return res.status(400).json({
                 success: false,
-                error: 'No wallet available for trading'
+                error: 'Portfolio not available for trading'
             });
         }
         
-        console.log(`Executing ${action}: ${amount} ${fromAsset} -> ${toAsset}`);
+        console.log(`Executing ${side} trade: ${amount} of ${product_id}`);
         
-        // Execute the trade
-        const trade = await defaultWallet.trade(amount, fromAsset, toAsset);
-        
-        // Wait for the trade to complete
-        await trade.wait();
-        
+        const order = {
+            product_id: product_id,
+            side: side,
+            order_configuration: {
+                market_market_ioc: {
+                    [side === 'BUY' ? 'quote_size' : 'base_size']: amount,
+                }
+            }
+        };
+
+        const result = await coinbase.rest.order.createOrder(order);
+
         res.json({
             success: true,
-            message: `${action} trade executed successfully`,
-            trade_id: trade.getId(),
-            status: trade.getStatus(),
-            transaction_hash: trade.getTransactionHash()
+            message: `Trade executed successfully`,
+            order_id: result.order_id,
+            status: 'SUBMITTED'
         });
         
     } catch (error) {
         console.error('Trade execution error:', error);
         res.status(500).json({
             success: false,
-            error: error.message
+            error: error.message,
+            error_details: error.response ? error.response.data : null
         });
     }
 });
 
-// Get trade quote
+// Get trade quote - Disabling as it's not the priority and requires more info.
 app.post('/quote', async (req, res) => {
-    try {
-        const { amount, fromAsset, toAsset } = req.body;
-        
-        if (!defaultWallet) {
-            return res.status(400).json({
-                success: false,
-                error: 'No wallet available for quote'
-            });
-        }
-        
-        // Create a trade quote (doesn't execute)
-        const trade = await defaultWallet.trade(amount, fromAsset, toAsset);
-        
-        res.json({
-            success: true,
-            quote: {
-                from_amount: amount,
-                from_asset: fromAsset,
-                to_asset: toAsset,
-                estimated_to_amount: trade.getToAmount(),
-                trade_id: trade.getId()
-            }
-        });
-        
-    } catch (error) {
-        console.error('Quote error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
+    res.status(501).json({ success: false, error: 'Quoting not implemented yet.' });
 });
 
-// Create new wallet
+// Create new wallet - Disabling as it's not applicable to the CDP API.
 app.post('/wallet/create', async (req, res) => {
-    try {
-        const newWallet = await Wallet.create();
-        res.json({
-            success: true,
-            wallet_id: newWallet.getId(),
-            message: 'Wallet created successfully'
-        });
-    } catch (error) {
-        console.error('Wallet creation error:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
+    res.status(501).json({ success: false, error: 'Wallet creation is not supported. Portfolios are used instead.' });
 });
 
 // Start server

@@ -21,11 +21,17 @@ import VoiceCommands from './components/VoiceCommands';
 import BotStatus from './components/BotStatus';
 import TradingHistory from './components/TradingHistory';
 import CryptoDashboard from './components/CryptoDashboard';
+import NotificationsModal from './components/NotificationsModal';
+import SettingsModal from './components/SettingsModal';
+
+import SportsBetting from './components/SportsBetting';
 
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [botConnected, setBotConnected] = useState(false);
   const [voiceActive, setVoiceActive] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const tabs = [
     { id: 'dashboard', name: 'Dashboard', icon: BarChart3 },
@@ -34,7 +40,7 @@ function App() {
     { id: 'sentiment', name: 'Sentiment', icon: Brain },
     { id: 'whales', name: 'Whale Tracker', icon: TrendingUp },
     { id: 'ai-strategies', name: 'AI Strategies', icon: Bot },
-    { id: 'voice', name: 'Voice Control', icon: Mic },
+    { id: 'sports-betting', name: 'Sports Betting', icon: Activity },
   ];
 
   const renderActiveComponent = () => {
@@ -51,8 +57,8 @@ function App() {
         return <WhaleTracker />;
       case 'ai-strategies':
         return <AIStrategies />;
-      case 'voice':
-        return <VoiceCommands />;
+      case 'sports-betting':
+        return <SportsBetting />;
       default:
         return <TradingDashboard />;
     }
@@ -86,11 +92,17 @@ function App() {
               {voiceActive ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
             </button>
 
-            <button className="p-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors">
+            <button 
+              onClick={() => setNotificationsOpen(true)}
+              className="p-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors"
+            >
               <Bell className="h-5 w-5" />
             </button>
 
-            <button className="p-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors">
+            <button 
+              onClick={() => setSettingsOpen(true)}
+              className="p-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors"
+            >
               <Settings className="h-5 w-5" />
             </button>
           </div>
@@ -132,6 +144,20 @@ function App() {
         <VoiceCommands 
           onClose={() => setVoiceActive(false)} 
           onCommand={(command) => console.log('Voice command:', command)}
+        />
+      )}
+
+      {/* Notifications Modal */}
+      {notificationsOpen && (
+        <NotificationsModal 
+          onClose={() => setNotificationsOpen(false)} 
+        />
+      )}
+
+      {/* Settings Modal */}
+      {settingsOpen && (
+        <SettingsModal 
+          onClose={() => setSettingsOpen(false)} 
         />
       )}
     </div>

@@ -13,7 +13,7 @@ import {
   X
 } from 'lucide-react';
 
-const VoiceCommands = ({ onClose, onCommand }) => {
+const VoiceCommands = ({ onClose = () => {}, onCommand }) => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [confidence, setConfidence] = useState(0);
@@ -232,7 +232,10 @@ const VoiceCommands = ({ onClose, onCommand }) => {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div 
+      className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
       <div className="bg-gray-900 rounded-xl max-w-4xl w-full max-h-[90vh] overflow-hidden border border-gray-700">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-gray-700">
@@ -246,10 +249,16 @@ const VoiceCommands = ({ onClose, onCommand }) => {
             </div>
           </div>
           <button
-            onClick={onClose}
-            className="p-2 rounded-lg bg-gray-700 text-gray-400 hover:bg-gray-600 transition-colors"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onClose();
+            }}
+            className="p-3 rounded-lg bg-red-600 hover:bg-red-700 text-white transition-colors z-50 flex-shrink-0"
+            type="button"
+            style={{ minWidth: '44px', minHeight: '44px' }}
           >
-            <X className="h-5 w-5" />
+            <X className="h-5 w-5 mx-auto" />
           </button>
         </div>
 

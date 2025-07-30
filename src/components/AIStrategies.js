@@ -21,133 +21,60 @@ const AIStrategies = () => {
   const [isGenerating, setIsGenerating] = useState(false);
 
   useEffect(() => {
-    // Initialize with sample strategies
-    const sampleStrategies = [
-      {
-        id: 'momentum_scalper',
-        name: 'AI Momentum Scalper',
-        description: 'High-frequency strategy based on price momentum and volume analysis',
-        type: 'aggressive',
-        confidence: 85,
-        expected_return: '15-25%',
-        risk_level: 'high',
-        timeframe: '1-5 minutes',
-        conditions: ['High volume', 'Strong momentum', 'Clear trend'],
-        performance: {
-          win_rate: 72,
-          avg_return: 1.8,
-          max_drawdown: -5.2,
-          trades_24h: 45
-        },
-        signals: {
-          entry: 'RSI divergence + volume spike',
-          exit: 'Momentum reversal or 2% target',
-          stop_loss: '1.5% from entry'
-        },
-        active: false
-      },
-      {
-        id: 'sentiment_rider',
-        name: 'Sentiment Momentum Rider',
-        description: 'Combines social sentiment with technical analysis for medium-term trades',
-        type: 'balanced',
-        confidence: 78,
-        expected_return: '8-15%',
-        risk_level: 'medium',
-        timeframe: '1-4 hours',
-        conditions: ['Positive sentiment shift', 'Technical confirmation', 'Volume support'],
-        performance: {
-          win_rate: 68,
-          avg_return: 3.2,
-          max_drawdown: -8.1,
-          trades_24h: 12
-        },
-        signals: {
-          entry: 'Sentiment score > 0.6 + breakout',
-          exit: 'Sentiment reversal or profit target',
-          stop_loss: '2.5% from entry'
-        },
-        active: true
-      },
-      {
-        id: 'whale_follower',
-        name: 'Whale Movement Tracker',
-        description: 'Follows large wallet movements and exchange flows for position sizing',
-        type: 'conservative',
-        confidence: 71,
-        expected_return: '5-12%',
-        risk_level: 'low',
-        timeframe: '4-24 hours',
-        conditions: ['Large whale transactions', 'Exchange flow changes', 'Technical support'],
-        performance: {
-          win_rate: 75,
-          avg_return: 2.1,
-          max_drawdown: -3.8,
-          trades_24h: 6
-        },
-        signals: {
-          entry: 'Whale accumulation + technical setup',
-          exit: 'Whale distribution or target hit',
-          stop_loss: '2% from entry'
-        },
-        active: false
-      }
-    ];
-
-    setStrategies(sampleStrategies);
-    setActiveStrategy(sampleStrategies.find(s => s.active));
+    fetchStrategies();
     generateAIInsights();
   }, []);
 
-  const generateAIInsights = () => {
-    setIsGenerating(true);
-    
-    // Simulate AI insight generation
-    setTimeout(() => {
-      const insights = [
-        {
-          id: 1,
-          type: 'opportunity',
-          title: 'Bullish Momentum Building',
-          description: 'AI detects accumulation pattern with 73% probability of upward movement in next 2-4 hours',
-          confidence: 73,
-          action: 'Consider increasing position size',
-          timestamp: new Date().toISOString()
-        },
-        {
-          id: 2,
-          type: 'warning',
-          title: 'Whale Distribution Alert',
-          description: 'Large wallet showing distribution pattern. Reduce risk exposure.',
-          confidence: 81,
-          action: 'Implement tighter stop losses',
-          timestamp: new Date(Date.now() - 15 * 60000).toISOString()
-        },
-        {
-          id: 3,
-          type: 'strategy',
-          title: 'Optimal Entry Window',
-          description: 'Technical indicators align for optimal entry in next 30 minutes',
-          confidence: 67,
-          action: 'Prepare for position entry',
-          timestamp: new Date(Date.now() - 30 * 60000).toISOString()
-        }
-      ];
-      
-      setAiInsights(insights);
-      setIsGenerating(false);
-    }, 2000);
+  const fetchStrategies = async () => {
+    try {
+      const response = await fetch('http://localhost:5001/api/strategies');
+      const data = await response.json();
+      if (data.success) {
+        setStrategies(data.strategies);
+        setActiveStrategy(data.strategies.find(s => s.active));
+      }
+    } catch (error) {
+      console.error("Error fetching strategies:", error);
+    }
   };
 
-  const toggleStrategy = (strategyId) => {
-    setStrategies(prev => prev.map(strategy => ({
-      ...strategy,
-      active: strategy.id === strategyId ? !strategy.active : strategy.active
-    })));
-    
+  const generateAIInsights = async () => {
+    setIsGenerating(true);
+    try {
+      const response = await fetch('http://localhost:5001/api/insights');
+      const data = await response.json();
+      if (data.success) {
+        setAiInsights(data.insights);
+      }
+    } catch (error) {
+      console.error("Error fetching insights:", error);
+    }
+    setIsGenerating(false);
+  };
+
+  const toggleStrategy = async (strategyId) => {
     const strategy = strategies.find(s => s.id === strategyId);
-    if (strategy && !strategy.active) {
-      setActiveStrategy(strategy);
+    if (!strategy) return;
+
+    const newActiveState = !strategy.active;
+
+    try {
+      const response = await fetch('http://localhost:5001/api/strategies/active', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ strategy_id: newActiveState ? strategyId : null }),
+      });
+      const data = await response.json();
+      if (data.success) {
+        setStrategies(prev => prev.map(s => (
+          s.id === strategyId ? { ...s, active: newActiveState } : { ...s, active: false }
+        )));
+        setActiveStrategy(newActiveState ? strategy : null);
+      }
+    } catch (error) {
+      console.error("Error setting active strategy:", error);
     }
   };
 

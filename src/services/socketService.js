@@ -13,10 +13,13 @@ class SocketService {
 
     // Connect to backend on port 5001
     this.socket = io('http://localhost:5001', {
-      transports: ['polling', 'websocket'],
-      upgrade: true,
-      timeout: 10000,
-      forceNew: true
+      transports: ['polling'], // Start with polling only to avoid websocket frame errors
+      timeout: 20000,
+      forceNew: true,
+      autoConnect: true,
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionAttempts: 5
     });
 
     this.socket.on('connect', () => {

@@ -12,13 +12,21 @@ import sys
 import os
 import re
 from textblob import TextBlob
+from auth import token_required, register_user, authenticate_user, refresh_token
+from coinbase_jwt import get_coinbase_headers
+import requests
+import uuid
 
 # Add the parent directory to sys.path to import the trading bot
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv('../.env')
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key'
-CORS(app, origins=["http://localhost:3000"], allow_headers=["Content-Type"], methods=["GET", "POST"])
+CORS(app, origins=["http://localhost:3000"], allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Global variables to store bot data
@@ -583,8 +591,120 @@ class TradingBotAdapter:
             logging.error(f"CDP service trade error: {e}")
             return {'success': False, 'error': f'CDP service failed: {str(e)}'}
     
+    def _execute_advanced_trade_jwt(self, action, symbol, amount_type, amount):
+        """Execute trade using Advanced Trade API with JWT authentication"""
+        try:
+            # Get current price for calculations
+            current_price = self._get_real_btc_price() if symbol == 'BTC-USDC' else 0
+            if current_price <= 0:
+                return {'success': False, 'error': 'Unable to get current price'}
+            
+            # Calculate order size
+            if amount_type == 'usd':
+                quote_size = str(round(amount, 2))
+                base_size = None
+            else:
+                base_size = str(round(amount, 8))
+                quote_size = None
+            
+            # Validate minimum order size
+            if amount_type == 'crypto' and amount < 0.00001:
+                return {'success': False, 'error': f'Order size too small. Minimum 0.00001 BTC, requested: {amount:.8f}'}
+            elif amount_type == 'usd' and amount < 1.0:
+                return {'success': False, 'error': f'Order size too small. Minimum $1.00 USD, requested: ${amount:.2f}'}
+            
+            # Generate unique client order ID
+            client_order_id = str(uuid.uuid4())
+            
+            # Map frontend symbol to Coinbase product ID
+            product_id = symbol
+            if symbol == 'BTC-USDC':
+                product_id = 'BTC-USD'  # Coinbase uses BTC-USD, not BTC-USDC
+            
+            # Prepare order body according to Coinbase API format
+            order_body = {
+                'client_order_id': client_order_id,
+                'product_id': product_id,
+                'side': action.upper(),
+                'order_configuration': {
+                    'market_market_ioc': {}
+                }
+            }
+            
+            # Set quote_size for buy orders or base_size for sell orders
+            if action.upper() == 'BUY':
+                order_body['order_configuration']['market_market_ioc']['quote_size'] = quote_size
+            else:
+                order_body['order_configuration']['market_market_ioc']['base_size'] = base_size
+            
+            # Convert to JSON string for JWT signing
+            body_json = json.dumps(order_body)
+            
+            # Get JWT authenticated headers
+            path = '/api/v3/brokerage/orders'
+            headers = get_coinbase_headers('POST', path, body_json)
+            
+            # Make the API request
+            url = f'https://api.coinbase.com{path}'
+            logging.info(f"Creating order with JWT: {order_body}")
+            
+            response = requests.post(url, headers=headers, data=body_json, timeout=30)
+            
+            logging.info(f"JWT order response status: {response.status_code}")
+            logging.info(f"JWT order response body: {response.text}")
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                logging.info(f"Order response: {response_data}")
+                
+                if response_data.get('success'):
+                    success_response = response_data.get('success_response', {})
+                    return {
+                        'success': True,
+                        'message': 'Order placed successfully',
+                        'order_id': success_response.get('order_id'),
+                        'executed_amount': float(base_size) if base_size else amount / current_price,
+                        'executed_price': current_price
+                    }
+                else:
+                    error_response = response_data.get('error_response', {})
+                    error_msg = error_response.get('error', 'Unknown error')
+                    return {'success': False, 'error': f'JWT Order failed: {error_msg}'}
+            else:
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('message', error_data.get('error', response.text))
+                except:
+                    error_msg = response.text
+                
+                full_error = f"JWT HTTP {response.status_code}: {error_msg}"
+                logging.error(f"JWT Order failed: {full_error}")
+                return {'success': False, 'error': full_error}
+                
+        except Exception as e:
+            logging.error(f"JWT Advanced Trade order error: {e}")
+            return {'success': False, 'error': f'Order execution failed: {str(e)}'}
+
     def _execute_advanced_trade(self, action, symbol, amount_type, amount):
-        """Execute trade using Advanced Trade API (fallback)"""
+        """Execute trade using Advanced Trade API (fallback to old method)"""
+        logging.info(f"Executing trade: {action} {amount} {amount_type} of {symbol}")
+        
+        # First try JWT authentication
+        logging.info("Trying JWT authentication method...")
+        jwt_result = self._execute_advanced_trade_jwt(action, symbol, amount_type, amount)
+        
+        if jwt_result['success']:
+            logging.info("✅ JWT method succeeded!")
+            return jwt_result
+        
+        logging.warning(f"JWT method failed: {jwt_result['error']}")
+        logging.info("Trying legacy SDK method...")
+        
+        # Return JWT error if it's a clear API error, don't try legacy
+        if any(keyword in jwt_result['error'].lower() for keyword in ['insufficient', 'minimum', 'invalid', 'unauthorized', 'forbidden']):
+            logging.error(f"JWT method failed with API error, not trying legacy: {jwt_result['error']}")
+            return jwt_result
+        
         try:
             # Get current price for calculations
             current_price = self._get_real_btc_price() if symbol == 'BTC-USDC' else 0
@@ -602,7 +722,6 @@ class TradingBotAdapter:
                 return {'success': False, 'error': f'Order size too small. Minimum 0.00001 BTC, requested: {crypto_amount:.8f}'}
             
             # Generate unique client order ID
-            import uuid
             client_order_id = str(uuid.uuid4())
             
             # Prepare order parameters
@@ -684,9 +803,53 @@ class TradingBotAdapter:
             logging.error(f"Error getting portfolios: {e}")
             return []
 
+    def get_account_balances_jwt(self):
+        """Get account balances using JWT authentication"""
+        try:
+            path = '/api/v3/brokerage/accounts'
+            headers = get_coinbase_headers('GET', path)
+            url = f'https://api.coinbase.com{path}'
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                accounts = data.get('accounts', [])
+                
+                balances = []
+                for account in accounts:
+                    currency = account.get('currency')
+                    available_balance = float(account.get('available_balance', {}).get('value', '0'))
+                    hold = float(account.get('hold', {}).get('value', '0'))
+                    
+                    if available_balance > 0 or hold > 0:
+                        balances.append({
+                            'currency': currency,
+                            'available': available_balance,
+                            'held': hold,
+                            'total': available_balance + hold
+                        })
+                
+                logging.info(f"JWT: Retrieved {len(balances)} account balances")
+                return balances
+            else:
+                logging.error(f"JWT account balances failed: HTTP {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logging.error(f"JWT account balances error: {e}")
+            return []
+
     def get_account_balances(self):
         """Get account balances for all currencies"""
         try:
+            # First try JWT method
+            jwt_balances = self.get_account_balances_jwt()
+            if jwt_balances:
+                return jwt_balances
+            
+            logging.warning("JWT balances failed, trying legacy method")
+            
             if not self.coinbase_client:
                 return []
             
@@ -1392,6 +1555,7 @@ def get_orders():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/trades')
+@token_required
 def get_trades():
     """Get fills/trades history"""
     try:
@@ -1437,6 +1601,7 @@ def get_crypto_detail(symbol):
     })
 
 @app.route('/api/execute-trade', methods=['POST'])
+@token_required
 def execute_trade():
     """Execute a real trade using Coinbase Advanced API"""
     try:
@@ -1481,6 +1646,7 @@ def execute_trade():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/get-quote', methods=['POST'])
+@token_required
 def get_quote():
     """Get a price quote for a potential trade"""
     try:
@@ -1672,6 +1838,7 @@ def get_ai_insights():
     return jsonify({'success': True, 'insights': insights})
 
 @app.route('/api/account-balances')
+@token_required
 def get_account_balances():
     """Get current account balances"""
     try:
@@ -1727,6 +1894,7 @@ def process_voice_command():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/test-trade')
+@token_required
 def test_minimal_trade():
     """Test a minimal trade to debug the exact issue"""
     try:
@@ -2406,6 +2574,7 @@ def generate_ai_summary(games, analysis):
     return summaries[len(games) % len(summaries)]
 
 @app.route('/api/account-status-debug')
+@token_required
 def get_account_status_debug():
     """Diagnostic endpoint to check account status and trading permissions"""
     try:
@@ -2452,6 +2621,88 @@ def get_account_status_debug():
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
+
+# Authentication endpoints
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """Register a new user"""
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+        email = data.get('email')
+        
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        
+        if len(password) < 6:
+            return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
+        
+        result = register_user(username, password, email)
+        
+        if result['success']:
+            return jsonify(result), 201
+        else:
+            return jsonify(result), 400
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Login user and return JWT token"""
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        
+        result = authenticate_user(username, password)
+        
+        if result['success']:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 401
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auth/refresh', methods=['POST'])
+def refresh():
+    """Refresh JWT token"""
+    try:
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                token = auth_header.split(" ")[1]
+            except IndexError:
+                return jsonify({'success': False, 'error': 'Invalid token format'}), 401
+        
+        if not token:
+            return jsonify({'success': False, 'error': 'Token is missing'}), 401
+        
+        result = refresh_token(token)
+        
+        if result['success']:
+            return jsonify(result), 200
+        else:
+            return jsonify(result), 401
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auth/verify', methods=['GET'])
+@token_required
+def verify_token_endpoint():
+    """Verify if token is valid"""
+    return jsonify({
+        'success': True, 
+        'message': 'Token is valid',
+        'user_id': request.current_user_id
+    })
 
 @socketio.on('connect')
 def handle_connect():

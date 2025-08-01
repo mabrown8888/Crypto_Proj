@@ -11,7 +11,8 @@ import {
   DollarSign,
   BarChart3,
   Settings,
-  History
+  History,
+  LogOut
 } from 'lucide-react';
 import TradingDashboard from './components/TradingDashboard';
 import SentimentAnalysis from './components/SentimentAnalysis';
@@ -23,8 +24,10 @@ import TradingHistory from './components/TradingHistory';
 import CryptoDashboard from './components/CryptoDashboard';
 import NotificationsModal from './components/NotificationsModal';
 import SettingsModal from './components/SettingsModal';
+import LoginForm from './components/LoginForm';
 
 import SportsBetting from './components/SportsBetting';
+import { authUtils, setupTokenRefresh } from './utils/auth';
 
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -32,6 +35,36 @@ function App() {
   const [voiceActive, setVoiceActive] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [username, setUsername] = useState('');
+
+  useEffect(() => {
+    // Check authentication status on app load
+    const authenticated = authUtils.isAuthenticated();
+    setIsAuthenticated(authenticated);
+    
+    if (authenticated) {
+      setUsername(authUtils.getUsername() || 'User');
+      setupTokenRefresh(); // Setup automatic token refresh
+    }
+  }, []);
+
+  const handleLogin = (loginData) => {
+    setIsAuthenticated(true);
+    setUsername(loginData.username);
+    setupTokenRefresh();
+  };
+
+  const handleLogout = () => {
+    authUtils.logout();
+    setIsAuthenticated(false);
+    setUsername('');
+  };
+
+  // If not authenticated, show login form
+  if (!isAuthenticated) {
+    return <LoginForm onLogin={handleLogin} />;
+  }
 
   const tabs = [
     { id: 'dashboard', name: 'Dashboard', icon: BarChart3 },
@@ -79,6 +112,10 @@ function App() {
           </div>
 
           <div className="flex items-center space-x-4">
+            <div className="text-sm text-gray-400">
+              Welcome, <span className="text-crypto-blue font-medium">{username}</span>
+            </div>
+            
             <BotStatus connected={botConnected} />
             
             <button 
@@ -104,6 +141,14 @@ function App() {
               className="p-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors"
             >
               <Settings className="h-5 w-5" />
+            </button>
+
+            <button 
+              onClick={handleLogout}
+              className="p-2 rounded-lg bg-red-600 text-white hover:bg-red-700 transition-colors"
+              title="Logout"
+            >
+              <LogOut className="h-5 w-5" />
             </button>
           </div>
         </div>

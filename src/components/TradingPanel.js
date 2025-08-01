@@ -10,6 +10,7 @@ import {
   Activity,
   Loader2
 } from 'lucide-react';
+import { authUtils } from '../utils/auth';
 
 const TradingPanel = () => {
   const [balances, setBalances] = useState([]);
@@ -37,10 +38,12 @@ const TradingPanel = () => {
 
   const fetchBalances = async () => {
     try {
-      const response = await fetch('http://localhost:5001/api/account-balances');
+      const response = await authUtils.authenticatedFetch('http://localhost:5001/api/account-balances');
       if (response.ok) {
         const data = await response.json();
         setBalances(data.balances || []);
+      } else if (response.status === 401) {
+        authUtils.logout();
       }
     } catch (error) {
       console.error('Error fetching balances:', error);
@@ -49,17 +52,16 @@ const TradingPanel = () => {
 
   const fetchQuote = async () => {
     try {
-      const response = await fetch('http://localhost:5001/api/get-quote', {
+      const response = await authUtils.authenticatedFetch('http://localhost:5001/api/get-quote', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify(tradeForm),
       });
       
       if (response.ok) {
         const data = await response.json();
         setQuote(data);
+      } else if (response.status === 401) {
+        authUtils.logout();
       }
     } catch (error) {
       console.error('Error fetching quote:', error);
@@ -79,11 +81,8 @@ const TradingPanel = () => {
     setError('');
     
     try {
-      const response = await fetch('http://localhost:5001/api/execute-trade', {
+      const response = await authUtils.authenticatedFetch('http://localhost:5001/api/execute-trade', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify(tradeForm),
       });
       

@@ -5453,6 +5453,227 @@ def hedge_expected_value():
         return jsonify({'error': str(e), 'success': False}), 500
 
 
+# =============================================================================
+# SMART CASH-OUT SYSTEM ENDPOINTS
+# =============================================================================
+
+@app.route('/api/hedge/cash-out/status', methods=['GET'])
+def cash_out_status():
+    """Get summary of all tracked positions for cash-out monitoring."""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        summary = hedge_engine.get_position_summary()
+        return jsonify({
+            'success': True,
+            **summary
+        })
+    except Exception as e:
+        logging.error(f"Error getting cash-out status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/check', methods=['GET'])
+def cash_out_check():
+    """
+    Check all positions for cash-out triggers.
+    Returns which positions should be cashed out and why.
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        # Check all positions but don't execute
+        result = hedge_engine.monitor_all_positions(dry_run=True)
+        return jsonify({
+            'success': True,
+            **result
+        })
+    except Exception as e:
+        logging.error(f"Error checking cash-out triggers: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/check/<ticker>', methods=['GET'])
+def cash_out_check_single(ticker):
+    """Check a specific position for cash-out triggers."""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        result = hedge_engine.check_cash_out(ticker)
+        return jsonify({
+            'success': True,
+            **result
+        })
+    except Exception as e:
+        logging.error(f"Error checking cash-out for {ticker}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/execute', methods=['POST'])
+def cash_out_execute():
+    """
+    Execute cash-out for triggered positions.
+
+    Request body:
+    {
+        "dry_run": true/false,  // If true, simulate without executing
+        "ticker": "KXBTC-...",  // Optional: specific ticker to cash out
+        "force": false          // If true, execute even without trigger
+    }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        dry_run = data.get('dry_run', True)
+        specific_ticker = data.get('ticker')
+        force = data.get('force', False)
+
+        if specific_ticker:
+            # Check and execute for specific ticker
+            check_result = hedge_engine.check_cash_out(specific_ticker)
+
+            if check_result['action'] == 'SELL' or force:
+                quantity = check_result.get('quantity') or check_result.get('current_quantity', 0)
+                trigger = check_result.get('trigger', 'manual') if not force else 'manual_force'
+
+                if quantity <= 0:
+                    return jsonify({'error': 'No quantity to sell'}), 400
+
+                exec_result = hedge_engine.execute_cash_out(
+                    ticker=specific_ticker,
+                    quantity=quantity,
+                    trigger=trigger,
+                    dry_run=dry_run
+                )
+                return jsonify({
+                    'success': exec_result.get('success', False),
+                    'check_result': check_result,
+                    'execution': exec_result
+                })
+            else:
+                return jsonify({
+                    'success': True,
+                    'message': 'No cash-out trigger met',
+                    'check_result': check_result
+                })
+        else:
+            # Monitor and execute all positions
+            result = hedge_engine.monitor_all_positions(dry_run=dry_run)
+            return jsonify({
+                'success': True,
+                **result
+            })
+
+    except Exception as e:
+        logging.error(f"Error executing cash-out: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/track', methods=['POST'])
+def cash_out_track_position():
+    """
+    Manually track a position for cash-out monitoring.
+    Useful for positions opened outside the automated system.
+
+    Request body:
+    {
+        "ticker": "KXBTC-26JAN2215-B89000",
+        "entry_price": 24,  // cents
+        "quantity": 10,
+        "side": "yes",
+        "model_prob": 0.30,  // optional
+        "market_prob": 0.24  // optional
+    }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        required = ['ticker', 'entry_price', 'quantity']
+        for field in required:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        hedge_engine.track_new_position(
+            ticker=data['ticker'],
+            entry_price=data['entry_price'],
+            quantity=data['quantity'],
+            model_prob=data.get('model_prob', data['entry_price'] / 100 + 0.05),
+            market_prob=data.get('market_prob', data['entry_price'] / 100),
+            side=data.get('side', 'yes')
+        )
+
+        return jsonify({
+            'success': True,
+            'message': f"Now tracking {data['ticker']} x{data['quantity']} @ {data['entry_price']}¢"
+        })
+
+    except Exception as e:
+        logging.error(f"Error tracking position: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/config', methods=['GET', 'POST'])
+def cash_out_config():
+    """Get or update cash-out configuration."""
+    try:
+        from hedge_engine import CASH_OUT_CONFIG
+
+        if request.method == 'GET':
+            return jsonify({
+                'success': True,
+                'config': CASH_OUT_CONFIG
+            })
+
+        # POST - update config
+        data = request.get_json() or {}
+        updated = []
+
+        for key, value in data.items():
+            if key in CASH_OUT_CONFIG:
+                CASH_OUT_CONFIG[key] = value
+                updated.append(key)
+
+        return jsonify({
+            'success': True,
+            'updated': updated,
+            'config': CASH_OUT_CONFIG
+        })
+
+    except Exception as e:
+        logging.error(f"Error with cash-out config: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/hedge/cash-out/sync', methods=['POST'])
+def cash_out_sync_positions():
+    """
+    Sync current Kalshi positions to the cash-out tracker.
+    Call this to import existing positions that weren't opened through the hedge engine.
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        result = hedge_engine.sync_positions_from_kalshi()
+        return jsonify(result)
+
+    except Exception as e:
+        logging.error(f"Error syncing positions: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
@@ -5469,16 +5690,123 @@ def handle_disconnect():
     """Handle client disconnection"""
     print('Client disconnected')
 
+
+# =============================================================================
+# AUTOMATIC CASH-OUT MONITOR (Background Thread)
+# =============================================================================
+
+cash_out_monitor_running = False
+CASH_OUT_CHECK_INTERVAL = 30  # Check every 30 seconds (for short-expiry contracts)
+
+def cash_out_monitor_loop():
+    """Background thread that monitors positions and auto-executes cash-outs."""
+    global cash_out_monitor_running
+
+    logging.info("Cash-out monitor started (checking every 30 seconds)")
+
+    # AUTO-SYNC: Pull current Kalshi positions into tracker on startup
+    if hedge_engine:
+        try:
+            sync_result = hedge_engine.sync_positions_from_kalshi()
+            logging.info(f"Auto-sync: {sync_result.get('message', 'done')}")
+        except Exception as e:
+            logging.error(f"Auto-sync failed: {e}")
+
+    while cash_out_monitor_running:
+        try:
+            if hedge_engine:
+                # Check all positions for exit triggers
+                result = hedge_engine.monitor_all_positions(dry_run=False)  # LIVE execution
+
+                if result.get('cash_outs_executed', 0) > 0:
+                    logging.info(f"AUTO CASH-OUT: Executed {result['cash_outs_executed']} cash-outs")
+                    for action in result.get('actions_taken', []):
+                        logging.info(f"  - {action['ticker']}: {action['reason']}")
+
+                    # Emit to connected clients
+                    socketio.emit('cash_out_alert', {
+                        'type': 'cash_out_executed',
+                        'count': result['cash_outs_executed'],
+                        'total_pnl': result.get('total_realized_pnl', 0),
+                        'actions': result.get('actions_taken', [])
+                    })
+
+                # Log status periodically
+                positions_count = result.get('positions_checked', 0)
+                if positions_count > 0:
+                    logging.debug(f"Cash-out monitor: Checked {positions_count} positions")
+
+        except Exception as e:
+            logging.error(f"Cash-out monitor error: {e}")
+
+        # Sleep in small intervals to allow clean shutdown
+        for _ in range(CASH_OUT_CHECK_INTERVAL):
+            if not cash_out_monitor_running:
+                break
+            time.sleep(1)
+
+    logging.info("Cash-out monitor stopped")
+
+
+def start_cash_out_monitor():
+    """Start the background cash-out monitor."""
+    global cash_out_monitor_running
+
+    if cash_out_monitor_running:
+        logging.warning("Cash-out monitor already running")
+        return
+
+    cash_out_monitor_running = True
+    thread = threading.Thread(target=cash_out_monitor_loop, daemon=True)
+    thread.start()
+    logging.info("Cash-out monitor thread started")
+
+
+def stop_cash_out_monitor():
+    """Stop the background cash-out monitor."""
+    global cash_out_monitor_running
+    cash_out_monitor_running = False
+    logging.info("Cash-out monitor stopping...")
+
+
+@app.route('/api/hedge/cash-out/monitor/start', methods=['POST'])
+def start_monitor_endpoint():
+    """Start the automatic cash-out monitor."""
+    start_cash_out_monitor()
+    return jsonify({'success': True, 'message': 'Cash-out monitor started'})
+
+
+@app.route('/api/hedge/cash-out/monitor/stop', methods=['POST'])
+def stop_monitor_endpoint():
+    """Stop the automatic cash-out monitor."""
+    stop_cash_out_monitor()
+    return jsonify({'success': True, 'message': 'Cash-out monitor stopped'})
+
+
+@app.route('/api/hedge/cash-out/monitor/status', methods=['GET'])
+def monitor_status_endpoint():
+    """Get cash-out monitor status."""
+    return jsonify({
+        'success': True,
+        'running': cash_out_monitor_running,
+        'check_interval_seconds': CASH_OUT_CHECK_INTERVAL
+    })
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     print("Starting AI Trading Co-Pilot Backend...")
-    
+
     # Initialize crypto data on startup
     print("Initializing cryptocurrency data...")
     bot_adapter.update_crypto_data()
-    
+
     # Start bot monitoring
     bot_adapter.start_bot_monitoring()
-    
+
+    # Cash-out monitor does NOT auto-start
+    # User must click "Start Cash-Outs" button in dashboard to enable
+    print("Cash-out monitor ready (start via dashboard button)")
+
     # Run the Flask-SocketIO app
     socketio.run(app, host='127.0.0.1', port=5001, debug=False, allow_unsafe_werkzeug=True)

@@ -35,7 +35,13 @@ const HedgeDashboard = () => {
   const [maxRisk, setMaxRisk] = useState(50);
   const [autoRefresh, setAutoRefresh] = useState(false);
 
+  // Cash-out monitor state
+  const [cashOutRunning, setCashOutRunning] = useState(false);
+  const [cashOutStatus, setCashOutStatus] = useState(null);
+  const [cashOutLoading, setCashOutLoading] = useState(false);
+
   const API_BASE = 'http://localhost:5001/api/kalshi';
+  const HEDGE_API = 'http://localhost:5001/api/hedge';
 
   const fetchOpportunities = useCallback(async () => {
     setLoading(true);
@@ -130,6 +136,105 @@ const HedgeDashboard = () => {
     return 'text-gray-400';
   };
 
+  // =========================================================================
+  // CASH-OUT MONITOR FUNCTIONS
+  // =========================================================================
+
+  // Check if monitor is running on component mount
+  useEffect(() => {
+    const checkMonitorStatus = async () => {
+      try {
+        const response = await axios.get(`${HEDGE_API}/cash-out/monitor/status`);
+        if (response.data.success) {
+          setCashOutRunning(response.data.running);
+        }
+      } catch (err) {
+        console.error('Failed to check cash-out monitor status:', err);
+      }
+    };
+    checkMonitorStatus();
+  }, []);
+
+  // Fetch cash-out status periodically when running
+  useEffect(() => {
+    let interval;
+    if (cashOutRunning) {
+      const fetchCashOutStatus = async () => {
+        try {
+          const response = await axios.get(`${HEDGE_API}/cash-out/status`);
+          if (response.data.success) {
+            setCashOutStatus(response.data);
+          }
+        } catch (err) {
+          console.error('Failed to fetch cash-out status:', err);
+        }
+      };
+      fetchCashOutStatus();
+      interval = setInterval(fetchCashOutStatus, 5000); // Update status every 5s
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [cashOutRunning]);
+
+  const startCashOutMonitor = async () => {
+    setCashOutLoading(true);
+    setError(null);
+    try {
+      const response = await axios.post(`${HEDGE_API}/cash-out/monitor/start`);
+      if (response.data.success) {
+        setCashOutRunning(true);
+        // User sees button state change to "Stop Cash-Outs"
+      }
+    } catch (err) {
+      console.error('Failed to start cash-out monitor:', err);
+      setError('Failed to start cash-out monitor');
+    } finally {
+      setCashOutLoading(false);
+    }
+  };
+
+  const stopCashOutMonitor = async () => {
+    setCashOutLoading(true);
+    setError(null);
+    try {
+      const response = await axios.post(`${HEDGE_API}/cash-out/monitor/stop`);
+      if (response.data.success) {
+        setCashOutRunning(false);
+        setCashOutStatus(null);
+        // User sees button state change to "Start Cash-Outs"
+      }
+    } catch (err) {
+      console.error('Failed to stop cash-out monitor:', err);
+      setError('Failed to stop cash-out monitor');
+    } finally {
+      setCashOutLoading(false);
+    }
+  };
+
+  const syncPositions = async () => {
+    setCashOutLoading(true);
+    setError(null);
+    try {
+      const response = await axios.post(`${HEDGE_API}/cash-out/sync`);
+      if (response.data.success) {
+        // Don't set executionResult for sync - it's not a trade execution
+        // Just refresh the status which will show updated position count
+        const statusResponse = await axios.get(`${HEDGE_API}/cash-out/status`);
+        if (statusResponse.data.success) {
+          setCashOutStatus(statusResponse.data);
+        }
+        // Show brief success in console, user sees updated position count
+        console.log(`Synced ${response.data.synced} positions from Kalshi`);
+      }
+    } catch (err) {
+      console.error('Failed to sync positions:', err);
+      setError('Failed to sync positions');
+    } finally {
+      setCashOutLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -169,6 +274,190 @@ const HedgeDashboard = () => {
           </div>
         </div>
       )}
+
+      {/* Cash-Out Monitor Control */}
+      <div className={`rounded-xl p-4 border ${cashOutRunning ? 'bg-green-900/20 border-green-500' : 'bg-gray-800 border-gray-700'}`}>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div className={`p-3 rounded-lg ${cashOutRunning ? 'bg-green-500/20' : 'bg-gray-700'}`}>
+              <Target className={cashOutRunning ? 'text-green-400' : 'text-gray-400'} size={24} />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                Smart Cash-Out Monitor
+                {cashOutRunning && (
+                  <span className="flex items-center gap-1 text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded-full">
+                    <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
+                    RUNNING
+                  </span>
+                )}
+              </h3>
+              <p className="text-gray-400 text-sm">
+                {cashOutRunning
+                  ? 'Checking positions every 30s for exit triggers'
+                  : 'Click Start to begin monitoring positions for auto cash-out'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={syncPositions}
+              disabled={cashOutLoading}
+              className="flex items-center gap-2 px-4 py-2 bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 rounded-lg font-medium transition-colors"
+              title="Import existing Kalshi positions into tracker"
+            >
+              {cashOutLoading ? (
+                <RefreshCw className="h-4 w-4 animate-spin" />
+              ) : (
+                <RefreshCw className="h-4 w-4" />
+              )}
+              Sync Positions
+            </button>
+            {cashOutRunning ? (
+              <button
+                onClick={stopCashOutMonitor}
+                disabled={cashOutLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-700 rounded-lg font-medium transition-colors"
+              >
+                {cashOutLoading ? (
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                ) : (
+                  <AlertCircle className="h-4 w-4" />
+                )}
+                Stop Cash-Outs
+              </button>
+            ) : (
+              <button
+                onClick={startCashOutMonitor}
+                disabled={cashOutLoading}
+                className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-700 rounded-lg font-medium transition-colors"
+              >
+                {cashOutLoading ? (
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="h-4 w-4" />
+                )}
+                Start Cash-Outs
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Cash-Out Status */}
+        {cashOutRunning && cashOutStatus && (
+          <div className="mt-4 pt-4 border-t border-gray-700">
+            <div className="grid grid-cols-4 gap-4">
+              <div className="text-center">
+                <p className="text-2xl font-bold text-white">{cashOutStatus.total_positions || 0}</p>
+                <p className="text-gray-400 text-xs">Positions Tracked</p>
+              </div>
+              <div className="text-center">
+                <p className={`text-2xl font-bold ${(cashOutStatus.total_unrealized_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  ${(cashOutStatus.total_unrealized_pnl || 0).toFixed(2)}
+                </p>
+                <p className="text-gray-400 text-xs">Unrealized P&L</p>
+              </div>
+              <div className="text-center">
+                <p className="text-2xl font-bold text-crypto-blue">${(cashOutStatus.total_realized_pnl || 0).toFixed(2)}</p>
+                <p className="text-gray-400 text-xs">Realized P&L</p>
+              </div>
+              <div className="text-center">
+                <p className={`text-2xl font-bold ${(cashOutStatus.total_pnl || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  ${(cashOutStatus.total_pnl || 0).toFixed(2)}
+                </p>
+                <p className="text-gray-400 text-xs">Total P&L</p>
+              </div>
+            </div>
+
+            {/* Positions Table */}
+            {cashOutStatus.positions && cashOutStatus.positions.length > 0 && (
+              <div className="mt-4 pt-4 border-t border-gray-700">
+                <h4 className="text-sm font-medium text-gray-400 mb-3">Position Details</h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-gray-500 text-xs uppercase tracking-wider">
+                        <th className="text-left pb-2 pr-4">Contract</th>
+                        <th className="text-right pb-2 px-3">Entry</th>
+                        <th className="text-right pb-2 px-3">Current</th>
+                        <th className="text-right pb-2 px-3">P&L</th>
+                        <th className="text-center pb-2 px-3">Zone</th>
+                        <th className="text-right pb-2 px-3">Expiry</th>
+                        <th className="text-left pb-2 pl-4">Signal</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-700/50">
+                      {cashOutStatus.positions.map((pos, idx) => {
+                        // Parse ticker to get strike info (e.g., KXBTCD-26JAN2217-T86749.99 -> T86749)
+                        const tickerParts = pos.ticker.split('-');
+                        const shortTicker = tickerParts.length >= 3
+                          ? `${tickerParts[1]} ${tickerParts[2].substring(0, 6)}...`
+                          : pos.ticker.substring(0, 15);
+
+                        const zoneColors = {
+                          'DEEP_ITM': 'bg-green-500/20 text-green-400',
+                          'ATM': 'bg-yellow-500/20 text-yellow-400',
+                          'OTM': 'bg-red-500/20 text-red-400',
+                          'unknown': 'bg-gray-500/20 text-gray-400'
+                        };
+
+                        const signalColors = {
+                          'SELL': 'text-red-400',
+                          'HOLD': 'text-gray-400'
+                        };
+
+                        return (
+                          <tr key={idx} className="hover:bg-gray-700/30">
+                            <td className="py-2 pr-4">
+                              <div className="flex flex-col">
+                                <span className="text-white font-medium">{shortTicker}</span>
+                                <span className="text-gray-500 text-xs">{pos.side.toUpperCase()} x{pos.current_quantity}</span>
+                              </div>
+                            </td>
+                            <td className="text-right py-2 px-3">
+                              <span className="text-gray-300">{pos.entry_price?.toFixed(1)}¢</span>
+                            </td>
+                            <td className="text-right py-2 px-3">
+                              <span className="text-white font-medium">
+                                {pos.current_price ? `${pos.current_price.toFixed(1)}¢` : '—'}
+                              </span>
+                            </td>
+                            <td className="text-right py-2 px-3">
+                              <span className={`font-medium ${pos.pnl_pct >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                {pos.pnl_pct >= 0 ? '+' : ''}{pos.pnl_pct?.toFixed(1)}%
+                              </span>
+                            </td>
+                            <td className="text-center py-2 px-3">
+                              <span className={`px-2 py-0.5 rounded text-xs font-medium ${zoneColors[pos.price_zone] || zoneColors['unknown']}`}>
+                                {pos.price_zone === 'DEEP_ITM' ? 'ITM' : pos.price_zone}
+                              </span>
+                            </td>
+                            <td className="text-right py-2 px-3">
+                              <span className={`text-xs ${pos.hours_to_expiry && pos.hours_to_expiry < 2 ? 'text-yellow-400 font-medium' : 'text-gray-400'}`}>
+                                {pos.expiry_display || '—'}
+                              </span>
+                            </td>
+                            <td className="py-2 pl-4">
+                              <div className="flex flex-col">
+                                <span className={`font-medium ${signalColors[pos.cash_out_signal] || 'text-gray-400'}`}>
+                                  {pos.cash_out_signal}
+                                </span>
+                                <span className="text-gray-500 text-xs truncate max-w-[150px]" title={pos.cash_out_reason}>
+                                  {pos.cash_out_reason}
+                                </span>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* BTC Price Chart */}
       <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
@@ -610,8 +899,8 @@ const HedgeDashboard = () => {
         </div>
       )}
 
-      {/* Execution Result */}
-      {executionResult && (
+      {/* Execution Result - only show for actual trade executions */}
+      {executionResult && executionResult.trades_executed !== undefined && (
         <div className={`border rounded-lg p-6 ${
           executionResult.success
             ? 'bg-green-500/10 border-green-500/30'

@@ -21,8 +21,72 @@ from hedge_optimizer import HedgeOptimizer, EnhancedHedgeOptimizer
 
 # Trade log file path
 TRADE_LOG_FILE = os.path.join(os.path.dirname(__file__), 'trade_log.json')
+# Position tracking file for cash-out system
+POSITION_TRACKER_FILE = os.path.join(os.path.dirname(__file__), 'position_tracker.json')
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# SMART CASH-OUT CONFIGURATION
+# =============================================================================
+CASH_OUT_CONFIG = {
+    # -------------------------------------------------------------------------
+    # PRICE-ZONE THRESHOLDS (determines which rules apply)
+    # -------------------------------------------------------------------------
+    'deep_itm_threshold': 70,      # Price > 70¢ = deep in the money
+    'otm_threshold': 30,           # Price < 30¢ = out of the money
+    # Between 30-70¢ = at the money (normal rules)
+
+    # -------------------------------------------------------------------------
+    # OUT OF THE MONEY (price < 30¢) - aggressive profit taking
+    # -------------------------------------------------------------------------
+    'otm_tier1_profit_pct': 0.20,  # +20% profit -> sell 50%
+    'otm_tier1_sell_pct': 0.50,
+    'otm_tier2_profit_pct': 0.40,  # +40% profit -> sell 30% more
+    'otm_tier2_sell_pct': 0.30,
+    'otm_tier3_profit_pct': 0.60,  # +60% profit -> sell remaining
+    'otm_tier3_sell_pct': 1.00,
+
+    # -------------------------------------------------------------------------
+    # AT THE MONEY (30-70¢) - normal profit taking
+    # -------------------------------------------------------------------------
+    'atm_tier1_profit_pct': 0.25,  # +25% profit -> sell 50%
+    'atm_tier1_sell_pct': 0.50,
+    'atm_tier2_profit_pct': 0.50,  # +50% profit -> sell 30% more
+    'atm_tier2_sell_pct': 0.30,
+    'atm_tier3_profit_pct': 0.75,  # +75% profit -> sell remaining
+    'atm_tier3_sell_pct': 1.00,
+
+    # -------------------------------------------------------------------------
+    # DEEP IN THE MONEY (price > 70¢) - let it ride to $1
+    # -------------------------------------------------------------------------
+    # NO profit-based exits! Expected payout is ~$1
+    # Only exit on: stop loss, spread collapse, or extreme theta
+    'ditm_min_profit_to_sell': 0.90,  # Only sell if +90% (i.e., basically at $1)
+
+    # -------------------------------------------------------------------------
+    # TIME-BASED RULES
+    # -------------------------------------------------------------------------
+    'urgent_exit_hours': 1,        # < 1 hour = urgent decisions
+    'theta_warning_hours': 6,      # < 6 hours = theta accelerating
+    'theta_exit_hours': 72,        # < 72 hours = consider theta (for longer dated)
+
+    # Near-expiry behavior:
+    'near_expiry_itm_hold': 60,    # If < 1hr left AND price > 60¢ → HOLD for $1
+    'near_expiry_otm_exit': 40,    # If < 1hr left AND price < 40¢ → EXIT (theta death)
+
+    # -------------------------------------------------------------------------
+    # UNIVERSAL RULES (apply to all zones)
+    # -------------------------------------------------------------------------
+    'spread_collapse_threshold': 0.02,  # Exit when edge < 2%
+    'stop_loss_pct': -0.30,             # Exit at -30% loss
+    'min_position_size': 1,
+
+    # -------------------------------------------------------------------------
+    # MONITORING
+    # -------------------------------------------------------------------------
+    'check_interval_seconds': 30,  # Check every 30 seconds
+}
 
 
 class HedgeEngine:
@@ -704,6 +768,16 @@ class HedgeEngine:
                         'ev': ev,
                         'placed_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z'
                     })
+
+                    # Track position for cash-out monitoring
+                    self.track_new_position(
+                        ticker=ticker,
+                        entry_price=price,
+                        quantity=quantity,
+                        model_prob=model_prob,
+                        market_prob=market_prob,
+                        side='yes'
+                    )
                 else:
                     failed_orders.append({
                         'ticker': ticker,
@@ -771,6 +845,839 @@ class HedgeEngine:
         except Exception as e:
             logger.error(f"Failed to load trade log: {e}")
         return []
+
+    # =========================================================================
+    # SMART CASH-OUT SYSTEM
+    # =========================================================================
+
+    def _load_position_tracker(self) -> Dict:
+        """Load position tracking data (entry prices, tier status)."""
+        try:
+            if os.path.exists(POSITION_TRACKER_FILE):
+                with open(POSITION_TRACKER_FILE, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load position tracker: {e}")
+        return {}
+
+    def _save_position_tracker(self, tracker: Dict) -> None:
+        """Save position tracking data."""
+        try:
+            with open(POSITION_TRACKER_FILE, 'w') as f:
+                json.dump(tracker, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save position tracker: {e}")
+
+    def track_new_position(self, ticker: str, entry_price: float, quantity: int,
+                           model_prob: float, market_prob: float, side: str = 'yes') -> None:
+        """
+        Track a new position for cash-out monitoring.
+
+        Args:
+            ticker: Market ticker
+            entry_price: Entry price in cents (0-100)
+            quantity: Number of contracts
+            model_prob: Model probability at entry (0-1)
+            market_prob: Market probability at entry (0-1)
+            side: 'yes' or 'no'
+        """
+        tracker = self._load_position_tracker()
+
+        tracker[ticker] = {
+            'ticker': ticker,
+            'entry_price': entry_price,
+            'entry_time': datetime.utcnow().isoformat() + 'Z',
+            'original_quantity': quantity,
+            'current_quantity': quantity,
+            'model_prob_at_entry': model_prob,
+            'market_prob_at_entry': market_prob,
+            'side': side,
+            'tier1_sold': False,
+            'tier2_sold': False,
+            'tier3_sold': False,
+            'total_sold': 0,
+            'realized_pnl': 0.0,
+            'cash_out_history': []
+        }
+
+        self._save_position_tracker(tracker)
+        logger.info(f"Tracking new position: {ticker} x{quantity} @ {entry_price}¢")
+
+    def sync_positions_from_kalshi(self) -> Dict:
+        """
+        Sync current Kalshi positions to the tracker.
+        - Adds any positions not already being tracked
+        - Updates entry prices for existing positions (fixes 0.0 entry prices)
+
+        Returns:
+            Dict with sync results
+        """
+        if not self.kalshi_engine:
+            return {'success': False, 'message': 'Kalshi engine not initialized', 'synced': 0}
+
+        tracker = self._load_position_tracker()
+        synced = []
+        updated = []
+        removed = []
+
+        # Clean up any yearly/long-dated contracts already in tracker
+        tickers_to_remove = [t for t in tracker.keys()
+                            if 'MAXY' in t or 'MINY' in t or 'MAX' in t.split('-')[0]]
+        for ticker in tickers_to_remove:
+            del tracker[ticker]
+            removed.append(ticker)
+            logger.info(f"Removed yearly contract from tracker: {ticker}")
+
+        try:
+            positions = self.kalshi_engine.get_positions()
+            if not positions:
+                if removed:
+                    self._save_position_tracker(tracker)
+                return {'success': True, 'message': f'No positions to sync, removed {len(removed)} yearly', 'synced': 0}
+
+            for pos in positions:
+                ticker = pos.get('ticker', '')
+                position_qty = pos.get('position', 0)
+
+                if position_qty == 0:
+                    continue
+
+                # Skip yearly/long-dated contracts - not suitable for active cash-out monitoring
+                if 'MAXY' in ticker or 'MINY' in ticker or 'MAX' in ticker.split('-')[0]:
+                    logger.debug(f"Skipping yearly contract: {ticker}")
+                    continue
+
+                # Get entry_price from Kalshi (calculated from total_traded / position)
+                entry_price = pos.get('entry_price', 0)
+                side = pos.get('side', 'yes').lower()
+                quantity = pos.get('quantity', abs(position_qty))
+
+                # Check if already tracked
+                if ticker in tracker:
+                    # Update entry price if it was 0 or missing (fix old bad syncs)
+                    old_entry = tracker[ticker].get('entry_price', 0)
+                    if old_entry == 0 and entry_price > 0:
+                        tracker[ticker]['entry_price'] = entry_price
+                        # Also update market_prob_at_entry
+                        tracker[ticker]['market_prob_at_entry'] = entry_price / 100.0
+                        tracker[ticker]['model_prob_at_entry'] = min(0.99, entry_price / 100.0 + 0.05)
+                        updated.append({
+                            'ticker': ticker,
+                            'old_entry': old_entry,
+                            'new_entry': entry_price
+                        })
+                        logger.info(f"Updated entry price: {ticker} {old_entry:.1f}¢ -> {entry_price:.1f}¢")
+                    # Update quantity if changed
+                    tracker[ticker]['current_quantity'] = quantity
+                    continue
+
+                # Estimate model_prob (we don't have it, use entry price + edge estimate)
+                market_prob = entry_price / 100.0 if entry_price > 0 else 0.5
+                model_prob = min(0.99, market_prob + 0.05)  # Assume 5% edge at entry
+
+                # Add to tracker
+                tracker[ticker] = {
+                    'ticker': ticker,
+                    'entry_price': entry_price,
+                    'entry_time': datetime.utcnow().isoformat() + 'Z',  # Unknown, use now
+                    'original_quantity': quantity,
+                    'current_quantity': quantity,
+                    'model_prob_at_entry': model_prob,
+                    'market_prob_at_entry': market_prob,
+                    'side': side,
+                    'tier1_sold': False,
+                    'tier2_sold': False,
+                    'tier3_sold': False,
+                    'total_sold': 0,
+                    'realized_pnl': 0.0,
+                    'cash_out_history': [],
+                    'synced_from_kalshi': True  # Mark as synced (not originally tracked)
+                }
+                synced.append({
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'entry_price': entry_price,
+                    'side': side
+                })
+                logger.info(f"Synced position: {ticker} x{quantity} @ {entry_price:.1f}¢ ({side})")
+
+            self._save_position_tracker(tracker)
+
+            parts = []
+            if synced:
+                parts.append(f'{len(synced)} new')
+            if updated:
+                parts.append(f'{len(updated)} updated')
+            if removed:
+                parts.append(f'{len(removed)} yearly removed')
+            message = 'Synced: ' + ', '.join(parts) if parts else 'No changes'
+
+            return {
+                'success': True,
+                'message': message,
+                'synced': len(synced),
+                'updated': len(updated),
+                'removed': len(removed),
+                'positions_synced': synced,
+                'positions_updated': updated
+            }
+
+        except Exception as e:
+            logger.error(f"Error syncing positions: {e}")
+            return {'success': False, 'message': str(e), 'synced': 0}
+
+    def get_current_market_price(self, ticker: str, side: str = 'yes') -> Optional[float]:
+        """
+        Get current market price for a ticker.
+
+        Args:
+            ticker: Market ticker
+            side: 'yes' or 'no' - which side's price to return
+
+        Returns:
+            Current bid price for the specified side (what you can sell for)
+        """
+        if not self.kalshi_engine:
+            return None
+
+        try:
+            market = self.kalshi_engine.get_market(ticker)
+            if market:
+                # Return the bid price for the side we own (what we can sell for)
+                if side.lower() == 'no':
+                    price = market.get('no_bid', market.get('no_ask', 0))
+                else:
+                    price = market.get('yes_bid', market.get('yes_ask', 0))
+
+                logger.debug(f"Market {ticker} ({side}): yes_bid={market.get('yes_bid')}, no_bid={market.get('no_bid')}, returning {price}")
+                return price if price > 0 else None
+            else:
+                logger.warning(f"No market data returned for {ticker}")
+        except Exception as e:
+            logger.error(f"Error getting market price for {ticker}: {e}")
+        return None
+
+    def get_hours_to_expiry(self, ticker: str) -> Optional[float]:
+        """Get hours until market expiry."""
+        try:
+            # First try to get from API
+            if self.kalshi_engine:
+                market = self.kalshi_engine.get_market(ticker)
+                if market:
+                    expiry_str = market.get('expiration_time') or market.get('close_time')
+                    if expiry_str:
+                        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                        now = datetime.now(expiry.tzinfo)
+                        delta = expiry - now
+                        return max(0, delta.total_seconds() / 3600)
+
+            # Fallback: parse from ticker (e.g., KXBTCD-26JAN2217-T89249.99)
+            # Format: 26JAN2217 = year 2026, month JAN, day 22, hour 17
+            parts = ticker.split('-')
+            if len(parts) >= 2:
+                date_part = parts[1]  # e.g., "26JAN2217"
+                if len(date_part) >= 9:
+                    year = int('20' + date_part[:2])  # 26 -> 2026
+                    month_str = date_part[2:5].upper()  # JAN
+                    day = int(date_part[5:7])  # 22
+                    hour = int(date_part[7:9])  # 17
+
+                    months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                             'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+                    month = months.get(month_str, 1)
+
+                    from datetime import timezone
+                    # Kalshi uses ET (Eastern Time), but for simplicity use UTC
+                    expiry = datetime(year, month, day, hour, 0, 0, tzinfo=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    delta = expiry - now
+                    hours = max(0, delta.total_seconds() / 3600)
+                    logger.debug(f"Parsed expiry from ticker {ticker}: {expiry}, hours={hours:.1f}")
+                    return hours
+
+        except Exception as e:
+            logger.error(f"Error getting expiry for {ticker}: {e}")
+        return None
+
+    def recalculate_model_prob(self, ticker: str, side: str = 'yes') -> Optional[float]:
+        """
+        Recalculate current model probability for a position.
+
+        Returns the probability for the side being traded.
+        """
+        try:
+            from market_data_service import get_market_data_service
+            from volatility_model import ProbabilityModel
+
+            # Get current BTC price
+            btc_price = self.get_btc_spot_price()
+            if not btc_price:
+                return None
+
+            # Parse strike from ticker (e.g., KXBTC-26JAN2215-B89000 -> 89000)
+            parts = ticker.split('-')
+            strike = None
+            for part in parts:
+                if part.startswith('B') or part.startswith('T'):
+                    try:
+                        strike = float(part[1:])
+                        break
+                    except ValueError:
+                        continue
+
+            if not strike:
+                logger.warning(f"Could not parse strike from ticker: {ticker}")
+                return None
+
+            # Get hours to expiry
+            hours = self.get_hours_to_expiry(ticker)
+            if hours is None:
+                hours = 24  # Default assumption
+
+            # Calculate model probability using ProbabilityModel (has get_probability method)
+            market_data = get_market_data_service()
+            returns = market_data.calculate_log_returns()
+
+            prob_model = ProbabilityModel()
+            prob_model.fit(returns)
+
+            prob_result = prob_model.get_probability(
+                current_price=btc_price,
+                strike=strike,
+                days_to_expiry=int(hours / 24) if hours >= 24 else 1
+            )
+
+            model_prob_yes = prob_result.get('adjusted_prob', prob_result.get('base_prob', 0.5))
+
+            # Return probability for the traded side
+            if side.lower() == 'yes':
+                return model_prob_yes
+            else:
+                return 1 - model_prob_yes
+
+        except Exception as e:
+            logger.error(f"Error recalculating model prob for {ticker}: {e}")
+            return None
+
+    def check_cash_out(self, ticker: str) -> Dict:
+        """
+        SMART cash-out check that considers:
+        - Price zone (OTM/ATM/ITM)
+        - Time to expiry
+        - Whether to let winners ride to $1
+
+        Returns:
+            Dict with 'action' ('SELL', 'HOLD'), 'pct' (0-1), 'reason', and analytics
+        """
+        tracker = self._load_position_tracker()
+
+        if ticker not in tracker:
+            return {'action': 'HOLD', 'reason': 'Position not tracked', 'ticker': ticker}
+
+        position = tracker[ticker]
+        entry_price = position['entry_price']
+        current_quantity = position['current_quantity']
+        side = position.get('side', 'yes')
+
+        if current_quantity < CASH_OUT_CONFIG['min_position_size']:
+            return {'action': 'HOLD', 'reason': 'Position too small', 'ticker': ticker}
+
+        # Get current market price for the side we own
+        current_price = self.get_current_market_price(ticker, side)
+        if current_price is None:
+            return {'action': 'HOLD', 'reason': 'Could not get current price', 'ticker': ticker}
+
+        # Calculate P&L percentage
+        pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+
+        # Get hours to expiry
+        hours_to_expiry = self.get_hours_to_expiry(ticker)
+
+        # Recalculate model probability
+        current_model_prob = self.recalculate_model_prob(ticker, side)
+        current_market_prob = current_price / 100.0
+
+        # Calculate current spread (edge)
+        spread = abs(current_model_prob - current_market_prob) if current_model_prob else None
+
+        # Determine price zone
+        deep_itm = current_price >= CASH_OUT_CONFIG['deep_itm_threshold']
+        otm = current_price <= CASH_OUT_CONFIG['otm_threshold']
+        atm = not deep_itm and not otm
+
+        zone = 'DEEP_ITM' if deep_itm else ('OTM' if otm else 'ATM')
+
+        # Build analytics
+        analytics = {
+            'ticker': ticker,
+            'entry_price': entry_price,
+            'current_price': current_price,
+            'pnl_pct': round(pnl_pct * 100, 2),
+            'pnl_dollars': round((current_price - entry_price) * current_quantity / 100, 2),
+            'current_quantity': current_quantity,
+            'hours_to_expiry': round(hours_to_expiry, 2) if hours_to_expiry is not None else None,
+            'current_model_prob': round(current_model_prob * 100, 1) if current_model_prob else None,
+            'current_market_prob': round(current_market_prob * 100, 1),
+            'spread': round(spread * 100, 2) if spread else None,
+            'tier1_sold': position['tier1_sold'],
+            'tier2_sold': position['tier2_sold'],
+            'price_zone': zone,
+        }
+
+        # =================================================================
+        # PRIORITY 1: STOP LOSS (all zones)
+        # =================================================================
+        if pnl_pct <= CASH_OUT_CONFIG['stop_loss_pct']:
+            return {
+                'action': 'SELL',
+                'pct': 1.0,
+                'quantity': current_quantity,
+                'reason': f"Stop loss ({pnl_pct*100:.1f}% loss)",
+                'trigger': 'stop_loss',
+                **analytics
+            }
+
+        # =================================================================
+        # PRIORITY 2: NEAR-EXPIRY SMART LOGIC
+        # =================================================================
+        if hours_to_expiry is not None and hours_to_expiry < CASH_OUT_CONFIG['urgent_exit_hours']:
+            # < 1 hour to expiry - make smart decision
+
+            # If price > 60¢, likely to settle at $1 - HOLD and let it settle
+            if current_price >= CASH_OUT_CONFIG['near_expiry_itm_hold']:
+                return {
+                    'action': 'HOLD',
+                    'reason': f"Near expiry BUT in-the-money ({current_price}¢ > {CASH_OUT_CONFIG['near_expiry_itm_hold']}¢) - let it settle at $1",
+                    'trigger': None,
+                    **analytics
+                }
+
+            # If price < 40¢, theta is crushing - EXIT
+            if current_price <= CASH_OUT_CONFIG['near_expiry_otm_exit']:
+                return {
+                    'action': 'SELL',
+                    'pct': 1.0,
+                    'quantity': current_quantity,
+                    'reason': f"Near expiry AND out-of-money ({current_price}¢ < {CASH_OUT_CONFIG['near_expiry_otm_exit']}¢) - theta death",
+                    'trigger': 'theta_urgent_otm',
+                    **analytics
+                }
+
+        # =================================================================
+        # PRIORITY 3: SPREAD COLLAPSE (edge gone)
+        # =================================================================
+        if spread is not None and spread < CASH_OUT_CONFIG['spread_collapse_threshold']:
+            # Exception: Don't exit deep ITM on spread collapse - let it ride to $1
+            if not deep_itm:
+                return {
+                    'action': 'SELL',
+                    'pct': 1.0,
+                    'quantity': current_quantity,
+                    'reason': f"Spread collapsed ({spread*100:.1f}% < {CASH_OUT_CONFIG['spread_collapse_threshold']*100}% edge)",
+                    'trigger': 'spread_collapse',
+                    **analytics
+                }
+
+        # =================================================================
+        # PRIORITY 4: ZONE-SPECIFIC PROFIT TAKING
+        # =================================================================
+
+        # -----------------------------------------------------------------
+        # DEEP IN THE MONEY (price > 70¢) - LET IT RIDE TO $1
+        # -----------------------------------------------------------------
+        if deep_itm:
+            # Don't take profits on high-probability winners
+            # Expected value of holding to $1 > selling now
+            # Only sell if basically at $1 already
+            if pnl_pct >= CASH_OUT_CONFIG['ditm_min_profit_to_sell']:
+                return {
+                    'action': 'SELL',
+                    'pct': 1.0,
+                    'quantity': current_quantity,
+                    'reason': f"Deep ITM at {current_price}¢ with +{pnl_pct*100:.0f}% - taking guaranteed profit",
+                    'trigger': 'ditm_lock_profit',
+                    **analytics
+                }
+            # Otherwise HOLD - let it settle at $1
+            return {
+                'action': 'HOLD',
+                'reason': f"Deep ITM ({current_price}¢) - holding for $1 payout (current P&L: +{pnl_pct*100:.1f}%)",
+                'trigger': None,
+                **analytics
+            }
+
+        # -----------------------------------------------------------------
+        # OUT OF THE MONEY (price < 30¢) - AGGRESSIVE profit taking
+        # -----------------------------------------------------------------
+        if otm:
+            tier1_pct = CASH_OUT_CONFIG['otm_tier1_profit_pct']
+            tier2_pct = CASH_OUT_CONFIG['otm_tier2_profit_pct']
+            tier3_pct = CASH_OUT_CONFIG['otm_tier3_profit_pct']
+            tier1_sell = CASH_OUT_CONFIG['otm_tier1_sell_pct']
+            tier2_sell = CASH_OUT_CONFIG['otm_tier2_sell_pct']
+
+            if pnl_pct >= tier3_pct and not position['tier3_sold']:
+                return {
+                    'action': 'SELL',
+                    'pct': 1.0,
+                    'quantity': current_quantity,
+                    'reason': f"OTM Tier 3: +{pnl_pct*100:.0f}% on long-shot - taking all profits",
+                    'trigger': 'otm_tier3_profit',
+                    **analytics
+                }
+
+            if pnl_pct >= tier2_pct and not position['tier2_sold']:
+                sell_qty = max(1, int(position['original_quantity'] * tier2_sell))
+                sell_qty = min(sell_qty, current_quantity)
+                return {
+                    'action': 'SELL',
+                    'pct': tier2_sell,
+                    'quantity': sell_qty,
+                    'reason': f"OTM Tier 2: +{pnl_pct*100:.0f}% - selling {tier2_sell*100:.0f}%",
+                    'trigger': 'otm_tier2_profit',
+                    **analytics
+                }
+
+            if pnl_pct >= tier1_pct and not position['tier1_sold']:
+                sell_qty = max(1, int(position['original_quantity'] * tier1_sell))
+                sell_qty = min(sell_qty, current_quantity)
+                return {
+                    'action': 'SELL',
+                    'pct': tier1_sell,
+                    'quantity': sell_qty,
+                    'reason': f"OTM Tier 1: +{pnl_pct*100:.0f}% on long-shot - locking in gains",
+                    'trigger': 'otm_tier1_profit',
+                    **analytics
+                }
+
+        # -----------------------------------------------------------------
+        # AT THE MONEY (30-70¢) - NORMAL profit taking
+        # -----------------------------------------------------------------
+        if atm:
+            tier1_pct = CASH_OUT_CONFIG['atm_tier1_profit_pct']
+            tier2_pct = CASH_OUT_CONFIG['atm_tier2_profit_pct']
+            tier3_pct = CASH_OUT_CONFIG['atm_tier3_profit_pct']
+            tier1_sell = CASH_OUT_CONFIG['atm_tier1_sell_pct']
+            tier2_sell = CASH_OUT_CONFIG['atm_tier2_sell_pct']
+
+            if pnl_pct >= tier3_pct and not position['tier3_sold']:
+                return {
+                    'action': 'SELL',
+                    'pct': 1.0,
+                    'quantity': current_quantity,
+                    'reason': f"ATM Tier 3: +{pnl_pct*100:.0f}% - taking remaining profits",
+                    'trigger': 'atm_tier3_profit',
+                    **analytics
+                }
+
+            if pnl_pct >= tier2_pct and not position['tier2_sold']:
+                sell_qty = max(1, int(position['original_quantity'] * tier2_sell))
+                sell_qty = min(sell_qty, current_quantity)
+                return {
+                    'action': 'SELL',
+                    'pct': tier2_sell,
+                    'quantity': sell_qty,
+                    'reason': f"ATM Tier 2: +{pnl_pct*100:.0f}% - selling {tier2_sell*100:.0f}%",
+                    'trigger': 'atm_tier2_profit',
+                    **analytics
+                }
+
+            if pnl_pct >= tier1_pct and not position['tier1_sold']:
+                sell_qty = max(1, int(position['original_quantity'] * tier1_sell))
+                sell_qty = min(sell_qty, current_quantity)
+                return {
+                    'action': 'SELL',
+                    'pct': tier1_sell,
+                    'quantity': sell_qty,
+                    'reason': f"ATM Tier 1: +{pnl_pct*100:.0f}% - locking in gains",
+                    'trigger': 'atm_tier1_profit',
+                    **analytics
+                }
+
+        # =================================================================
+        # NO TRIGGER MET - HOLD
+        # =================================================================
+        return {
+            'action': 'HOLD',
+            'reason': f'{zone} position, no exit trigger met',
+            'trigger': None,
+            **analytics
+        }
+
+    def execute_cash_out(self, ticker: str, quantity: int, trigger: str, dry_run: bool = True) -> Dict:
+        """
+        Execute a cash-out (sell) order.
+
+        Args:
+            ticker: Market ticker to sell
+            quantity: Number of contracts to sell
+            trigger: The trigger that caused this cash-out
+            dry_run: If True, simulate without placing real order
+
+        Returns:
+            Dict with execution results
+        """
+        tracker = self._load_position_tracker()
+
+        if ticker not in tracker:
+            return {'success': False, 'message': 'Position not tracked'}
+
+        position = tracker[ticker]
+        side = position.get('side', 'yes')
+        current_price = self.get_current_market_price(ticker, side)
+
+        if current_price is None:
+            return {'success': False, 'message': 'Could not get current market price'}
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would sell {quantity}x {ticker} @ {current_price}¢ (trigger: {trigger})")
+            return {
+                'success': True,
+                'dry_run': True,
+                'ticker': ticker,
+                'quantity': quantity,
+                'price': current_price,
+                'trigger': trigger,
+                'message': f'[DRY RUN] Would sell {quantity} contracts'
+            }
+
+        # Execute real sell order
+        if not self.kalshi_engine:
+            return {'success': False, 'message': 'Kalshi engine not initialized'}
+
+        try:
+            side = position.get('side', 'yes')
+            sell_price = int(current_price)
+
+            logger.info(f"Executing cash-out: SELL {quantity}x {ticker} ({side}) @ {sell_price}¢ | Trigger: {trigger}")
+
+            # Place sell order
+            order_result = self.kalshi_engine.place_order(
+                ticker=ticker,
+                side=side,
+                quantity=quantity,
+                price=sell_price,
+                action='sell',
+                order_type='limit'  # Use limit order at current bid
+            )
+
+            if order_result and order_result.get('order_id'):
+                # Update position tracker
+                entry_price = position['entry_price']
+                pnl = (current_price - entry_price) * quantity / 100.0
+
+                position['current_quantity'] -= quantity
+                position['total_sold'] += quantity
+                position['realized_pnl'] += pnl
+
+                # Mark tier as sold
+                if trigger == 'tier1_profit':
+                    position['tier1_sold'] = True
+                elif trigger == 'tier2_profit':
+                    position['tier2_sold'] = True
+                elif trigger == 'tier3_profit':
+                    position['tier3_sold'] = True
+
+                # Add to cash-out history
+                position['cash_out_history'].append({
+                    'time': datetime.utcnow().isoformat() + 'Z',
+                    'quantity': quantity,
+                    'price': current_price,
+                    'trigger': trigger,
+                    'pnl': pnl,
+                    'order_id': order_result.get('order_id')
+                })
+
+                # Remove position if fully closed
+                if position['current_quantity'] <= 0:
+                    del tracker[ticker]
+                    logger.info(f"Position fully closed: {ticker}")
+                else:
+                    tracker[ticker] = position
+
+                self._save_position_tracker(tracker)
+
+                logger.info(f"Cash-out executed: {ticker} | Sold {quantity} @ {current_price}¢ | P&L: ${pnl:.2f} | Order: {order_result.get('order_id')}")
+
+                return {
+                    'success': True,
+                    'ticker': ticker,
+                    'quantity': quantity,
+                    'price': current_price,
+                    'trigger': trigger,
+                    'pnl': pnl,
+                    'order_id': order_result.get('order_id'),
+                    'remaining_quantity': position.get('current_quantity', 0),
+                    'message': f'Sold {quantity} contracts @ {current_price}¢ (P&L: ${pnl:.2f})'
+                }
+            else:
+                logger.error(f"Cash-out order failed for {ticker}: {order_result}")
+                return {
+                    'success': False,
+                    'message': f"Order failed - no order_id returned"
+                }
+
+        except Exception as e:
+            logger.error(f"Error executing cash-out for {ticker}: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    def monitor_all_positions(self, dry_run: bool = True) -> Dict:
+        """
+        Monitor all tracked positions and check for cash-out opportunities.
+
+        Args:
+            dry_run: If True, don't execute actual sells
+
+        Returns:
+            Dict with monitoring results and any triggered cash-outs
+        """
+        tracker = self._load_position_tracker()
+
+        results = {
+            'positions_checked': 0,
+            'cash_outs_triggered': 0,
+            'cash_outs_executed': 0,
+            'total_realized_pnl': 0.0,
+            'positions': [],
+            'actions_taken': []
+        }
+
+        for ticker, position in list(tracker.items()):
+            results['positions_checked'] += 1
+
+            # Check if cash-out should be triggered
+            check_result = self.check_cash_out(ticker)
+            results['positions'].append(check_result)
+
+            if check_result['action'] == 'SELL':
+                results['cash_outs_triggered'] += 1
+
+                # Execute the cash-out
+                exec_result = self.execute_cash_out(
+                    ticker=ticker,
+                    quantity=check_result['quantity'],
+                    trigger=check_result.get('trigger', 'manual'),
+                    dry_run=dry_run
+                )
+
+                results['actions_taken'].append({
+                    'ticker': ticker,
+                    'trigger': check_result.get('trigger'),
+                    'reason': check_result.get('reason'),
+                    'quantity': check_result.get('quantity'),
+                    'execution': exec_result
+                })
+
+                if exec_result.get('success'):
+                    results['cash_outs_executed'] += 1
+                    results['total_realized_pnl'] += exec_result.get('pnl', 0)
+
+        results['message'] = (
+            f"Checked {results['positions_checked']} positions, "
+            f"{results['cash_outs_triggered']} triggers, "
+            f"{results['cash_outs_executed']} executed"
+        )
+
+        return results
+
+    def get_position_summary(self) -> Dict:
+        """Get summary of all tracked positions with current status and cash-out signals."""
+        tracker = self._load_position_tracker()
+
+        positions = []
+        total_unrealized_pnl = 0.0
+        total_realized_pnl = 0.0
+        skipped_long_dated = 0
+
+        for ticker, position in tracker.items():
+            # Skip yearly/long-dated contracts (e.g., KXBTCMAXY-26DEC31-199999.99)
+            # These shouldn't be in active cash-out monitoring
+            if 'MAXY' in ticker or 'MINY' in ticker or 'MAX' in ticker.split('-')[0]:
+                skipped_long_dated += 1
+                continue
+
+            side = position.get('side', 'yes')
+            current_price = self.get_current_market_price(ticker, side)
+            entry_price = position['entry_price']
+            current_qty = position['current_quantity']
+
+            # Skip positions with no current price (likely settled/closed markets)
+            if current_price is None:
+                logger.warning(f"Skipping {ticker} ({side}) - no current price (market may be settled)")
+                continue
+
+            if current_price and entry_price:
+                unrealized_pnl = (current_price - entry_price) * current_qty / 100.0
+                pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+            else:
+                unrealized_pnl = 0
+                pnl_pct = 0
+
+            total_unrealized_pnl += unrealized_pnl
+            total_realized_pnl += position.get('realized_pnl', 0)
+
+            # Get cash-out signal for this position
+            cash_out_result = self.check_cash_out(ticker)
+
+            # Determine price zone
+            price_zone = 'unknown'
+            if current_price:
+                if current_price >= CASH_OUT_CONFIG['deep_itm_threshold']:
+                    price_zone = 'DEEP_ITM'
+                elif current_price <= CASH_OUT_CONFIG['otm_threshold']:
+                    price_zone = 'OTM'
+                else:
+                    price_zone = 'ATM'
+
+            # Get expiry info
+            hours_to_expiry = self.get_hours_to_expiry(ticker)
+
+            # Parse expiry date from ticker for display (e.g., "26JAN2217" -> "Jan 22 5PM")
+            expiry_display = None
+            try:
+                parts = ticker.split('-')
+                if len(parts) >= 2:
+                    date_part = parts[1]  # e.g., "26JAN2217"
+                    if len(date_part) >= 9:
+                        month_str = date_part[2:5].upper()  # JAN
+                        day = int(date_part[5:7])  # 22
+                        hour = int(date_part[7:9])  # 17
+                        hour_display = f"{hour % 12 or 12}{'PM' if hour >= 12 else 'AM'}"
+                        expiry_display = f"{month_str.title()} {day} {hour_display}"
+            except:
+                pass
+
+            positions.append({
+                'ticker': ticker,
+                'entry_price': entry_price,
+                'current_price': current_price,
+                'current_quantity': current_qty,
+                'original_quantity': position['original_quantity'],
+                'unrealized_pnl': round(unrealized_pnl, 2),
+                'realized_pnl': round(position.get('realized_pnl', 0), 2),
+                'pnl_pct': round(pnl_pct, 2),
+                'tier1_sold': position.get('tier1_sold', False),
+                'tier2_sold': position.get('tier2_sold', False),
+                'entry_time': position.get('entry_time'),
+                'side': position.get('side', 'yes'),
+                'price_zone': price_zone,
+                'hours_to_expiry': round(hours_to_expiry, 1) if hours_to_expiry else None,
+                'expiry_display': expiry_display,
+                'cash_out_signal': cash_out_result.get('action', 'HOLD'),
+                'cash_out_reason': cash_out_result.get('reason', ''),
+                'cash_out_pct': cash_out_result.get('pct', 0)
+            })
+
+        # Sort by P&L % descending
+        positions.sort(key=lambda x: x['pnl_pct'], reverse=True)
+
+        return {
+            'positions': positions,
+            'total_positions': len(positions),
+            'total_unrealized_pnl': round(total_unrealized_pnl, 2),
+            'total_realized_pnl': round(total_realized_pnl, 2),
+            'total_pnl': round(total_unrealized_pnl + total_realized_pnl, 2)
+        }
 
     def get_hedge_status(self) -> Dict:
         """

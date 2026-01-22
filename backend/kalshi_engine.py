@@ -410,9 +410,54 @@ class KalshiEngine:
         logger.info(f"Returning {len(all_markets)} crypto markets")
         return all_markets
 
+    def get_market(self, ticker: str) -> Optional[Dict]:
+        """
+        Get market information for a specific ticker.
+        Returns prices in cents (0-99) for consistency with other methods.
+
+        Args:
+            ticker: Market ticker symbol
+
+        Returns:
+            Market dictionary with prices in cents
+        """
+        result = self._make_authenticated_request('GET', f'/markets/{ticker}')
+
+        if not result or 'market' not in result:
+            return None
+
+        market = result['market']
+
+        # Get bid/ask prices (already in cents from API)
+        yes_bid = market.get('yes_bid', 0)
+        yes_ask = market.get('yes_ask', 0)
+        no_bid = market.get('no_bid', 0)
+        no_ask = market.get('no_ask', 0)
+
+        return {
+            'ticker': market.get('ticker'),
+            'title': market.get('title'),
+            'subtitle': market.get('subtitle'),
+            'category': market.get('category'),
+            'close_time': market.get('close_time'),
+            'expiration_time': market.get('expiration_time'),
+            'yes_bid': yes_bid,
+            'yes_ask': yes_ask,
+            'no_bid': no_bid,
+            'no_ask': no_ask,
+            'yes_price': (yes_bid + yes_ask) / 2 if yes_ask > 0 else yes_bid,
+            'no_price': (no_bid + no_ask) / 2 if no_ask > 0 else no_bid,
+            'last_price': market.get('last_price', 0),
+            'volume': market.get('volume', 0),
+            'open_interest': market.get('open_interest', 0),
+            'status': market.get('status')
+        }
+
     def get_market_details(self, ticker: str) -> Optional[Dict]:
         """
-        Get detailed information about a specific market
+        Get detailed information about a specific market.
+        NOTE: Returns prices as decimals (0-1) for backward compatibility.
+        Use get_market() for cents-based prices.
 
         Args:
             ticker: Market ticker symbol
@@ -568,6 +613,7 @@ class KalshiEngine:
         side: str,
         quantity: int,
         price: int,
+        action: str = "buy",
         order_type: str = "limit"
     ) -> Optional[Dict]:
         """
@@ -578,6 +624,7 @@ class KalshiEngine:
             side: "yes" or "no"
             quantity: Number of contracts
             price: Price in cents (1-99)
+            action: "buy" or "sell"
             order_type: "limit" or "market"
 
         Returns:
@@ -589,7 +636,7 @@ class KalshiEngine:
 
         order_data = {
             'ticker': ticker,
-            'action': 'buy',  # Always buy (can buy yes or no)
+            'action': action.lower(),
             'side': side.lower(),
             'count': quantity,
             'type': order_type,
@@ -597,20 +644,24 @@ class KalshiEngine:
             'no_price': price if side.lower() == 'no' else None
         }
 
+        logger.info(f"Placing {action} order: {ticker} {side} x{quantity} @ {price}¢")
         result = self._make_authenticated_request('POST', '/portfolio/orders', order_data)
 
         if result and 'order' in result:
             order = result['order']
+            logger.info(f"Order placed successfully: {order.get('order_id')}")
             return {
                 'order_id': order.get('order_id'),
                 'ticker': ticker,
                 'side': side,
+                'action': action,
                 'quantity': quantity,
                 'price': price,
                 'status': order.get('status'),
                 'timestamp': datetime.now().isoformat()
             }
 
+        logger.error(f"Failed to place order: {result}")
         return None
 
     def cancel_order(self, order_id: str) -> bool:

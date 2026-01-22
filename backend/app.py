@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 import threading
@@ -16,6 +16,12 @@ from auth import token_required, register_user, authenticate_user, refresh_token
 from coinbase_jwt import get_coinbase_headers
 import requests
 import uuid
+from auto_trading_engine import AutoTradingEngine
+from enhanced_auto_trading_engine import EnhancedAutoTradingEngine
+from polymarket_engine import PolymarketEngine
+from kalshi_engine import KalshiEngine
+from hedge_engine import HedgeEngine
+from kalshi_ml_trader import SmartKalshiTrader
 
 # Add the parent directory to sys.path to import the trading bot
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -232,26 +238,62 @@ class TradingBotAdapter:
             logging.error(f"Error updating bot data: {e}")
             bot_data['connected'] = False
             
-    def _get_real_btc_price(self):
-        """Get real BTC price from Coinbase"""
+    def _get_real_price(self, symbol='BTC-USDC'):
+        """Get real price for any crypto from Coinbase"""
         try:
+            logging.info(f"Getting real price for {symbol}")
+
+            # Try Coinbase public API first (works for all symbols)
+            try:
+                # Map symbol to Coinbase format (e.g., ETH-USDC becomes ETH-USD)
+                product_id = symbol.replace('-USDC', '-USD')
+                url = f'https://api.coinbase.com/v2/prices/{product_id}/spot'
+                logging.info(f"Fetching price from: {url}")
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    data = response.json()
+                    price = float(data.get('data', {}).get('amount', 0))
+                    if price > 0:
+                        logging.info(f"Got price for {symbol} from public API: ${price}")
+                        return price
+            except Exception as api_error:
+                logging.warning(f"Public API failed for {symbol}: {api_error}")
+
+            # Try SDK method
             if self.coinbase_client:
-                # Get product ticker using the REST client
-                ticker = self.coinbase_client.get_product('BTC-USDC')
+                ticker = self.coinbase_client.get_product(symbol)
                 if ticker:
                     # Handle different response formats
                     if hasattr(ticker, 'price'):
-                        return float(ticker.price)
+                        price = float(ticker.price)
+                        logging.info(f"Got price for {symbol} from SDK: ${price}")
+                        return price
                     elif hasattr(ticker, 'quote_size'):
-                        return float(ticker.quote_size)
+                        price = float(ticker.quote_size)
+                        logging.info(f"Got price for {symbol} from SDK: ${price}")
+                        return price
                     elif isinstance(ticker, dict):
-                        return float(ticker.get('price', ticker.get('ask', ticker.get('bid', 0))))
-            
-            # Fallback to CoinGecko
-            return self._get_current_btc_price()
+                        price = float(ticker.get('price', ticker.get('ask', ticker.get('bid', 0))))
+                        if price > 0:
+                            logging.info(f"Got price for {symbol} from SDK: ${price}")
+                            return price
+
+            # Fallback to CoinGecko for BTC
+            if symbol == 'BTC-USDC':
+                logging.info("Falling back to CoinGecko for BTC")
+                return self._get_current_btc_price()
+
+            logging.error(f"No price available for {symbol}")
+            return 0
         except Exception as e:
-            logging.error(f"Error getting real BTC price: {e}")
-            return self._get_current_btc_price()
+            logging.error(f"Error getting real price for {symbol}: {e}", exc_info=True)
+            if symbol == 'BTC-USDC':
+                return self._get_current_btc_price()
+            return 0
+
+    def _get_real_btc_price(self):
+        """Get real BTC price from Coinbase (legacy wrapper)"""
+        return self._get_real_price('BTC-USDC')
             
     def _get_real_portfolio_value(self):
         """Get real portfolio value from Coinbase"""
@@ -352,7 +394,97 @@ class TradingBotAdapter:
         except Exception as e:
             logging.error(f"Error getting fills history: {e}")
             return []
-            
+
+    def calculate_pnl_from_trades(self):
+        """Calculate P&L from actual trade history"""
+        try:
+            fills = self.get_fills_history(limit=100)
+            if not fills:
+                return {
+                    'daily_pnl': 0.0,
+                    'total_pnl': 0.0,
+                    'daily_trades': 0
+                }
+
+            # Group trades by product to calculate P&L
+            positions = {}
+            daily_pnl = 0.0
+            total_pnl = 0.0
+            daily_trades = 0
+            today = datetime.now().date()
+
+            for fill in fills:
+                product = fill['product_id']
+                side = fill['side']
+                size = fill['size']
+                price = fill['price']
+                fee = fill['fee']
+                created_at = fill['created_at']
+
+                # Parse timestamp
+                try:
+                    if isinstance(created_at, str):
+                        trade_date = datetime.fromisoformat(created_at.replace('Z', '+00:00')).date()
+                    else:
+                        trade_date = created_at.date() if hasattr(created_at, 'date') else today
+                except:
+                    trade_date = today
+
+                # Count today's trades
+                if trade_date == today:
+                    daily_trades += 1
+
+                # Initialize position for this product
+                if product not in positions:
+                    positions[product] = {
+                        'buys': [],
+                        'sells': [],
+                        'realized_pnl': 0.0
+                    }
+
+                # Track buys and sells
+                if side.upper() == 'BUY':
+                    positions[product]['buys'].append({
+                        'size': size,
+                        'price': price,
+                        'fee': fee,
+                        'date': trade_date
+                    })
+                elif side.upper() == 'SELL':
+                    # Calculate realized P&L for sells
+                    # Simple FIFO matching
+                    remaining_sell = size
+                    for buy in positions[product]['buys']:
+                        if remaining_sell <= 0:
+                            break
+
+                        matched_size = min(buy['size'], remaining_sell)
+                        buy_cost = matched_size * buy['price'] + buy['fee'] * (matched_size / buy['size'])
+                        sell_revenue = matched_size * price - fee * (matched_size / size)
+                        pnl = sell_revenue - buy_cost
+
+                        positions[product]['realized_pnl'] += pnl
+                        if trade_date == today:
+                            daily_pnl += pnl
+                        total_pnl += pnl
+
+                        buy['size'] -= matched_size
+                        remaining_sell -= matched_size
+
+            return {
+                'daily_pnl': round(daily_pnl, 2),
+                'total_pnl': round(total_pnl, 2),
+                'daily_trades': daily_trades
+            }
+
+        except Exception as e:
+            logging.error(f"Error calculating P&L: {e}")
+            return {
+                'daily_pnl': 0.0,
+                'total_pnl': 0.0,
+                'daily_trades': 0
+            }
+
     def update_crypto_data(self):
         """Update data for all supported cryptocurrencies"""
         try:
@@ -422,92 +554,124 @@ class TradingBotAdapter:
             logging.error(f"Error updating crypto data: {e}")
             
     def get_portfolio_breakdown(self):
-        """Get portfolio breakdown across all cryptocurrencies"""
+        """Get portfolio breakdown across all cryptocurrencies and Kalshi positions"""
         try:
-            if not self.coinbase_client:
-                return portfolio_data
-                
-            accounts = self.coinbase_client.get_accounts()
-            if not accounts:
-                return portfolio_data
-                
             total_value = 0
             allocations = {}
-            
-            # Handle different response formats
-            accounts_list = []
-            if hasattr(accounts, 'accounts'):
-                accounts_list = accounts.accounts
-            elif isinstance(accounts, dict) and 'accounts' in accounts:
-                accounts_list = accounts['accounts']
-            elif isinstance(accounts, list):
-                accounts_list = accounts
-            
-            for account in accounts_list:
-                try:
-                    # Handle different account object formats
-                    if hasattr(account, 'currency'):
-                        currency = account.currency
-                    elif isinstance(account, dict):
-                        currency = account.get('currency')
-                    else:
-                        continue
-                    
-                    # Get balance with different possible formats
-                    balance = 0
-                    if hasattr(account, 'available_balance'):
-                        if hasattr(account.available_balance, 'value'):
-                            balance = float(account.available_balance.value)
-                        elif isinstance(account.available_balance, dict):
-                            balance = float(account.available_balance.get('value', 0))
-                        elif isinstance(account.available_balance, (int, float, str)):
-                            balance = float(account.available_balance)
-                    elif isinstance(account, dict):
-                        if 'available_balance' in account:
-                            if isinstance(account['available_balance'], dict):
-                                balance = float(account['available_balance'].get('value', 0))
+
+            # Get Coinbase accounts
+            if self.coinbase_client:
+                accounts = self.coinbase_client.get_accounts()
+                if accounts:
+                    # Handle different response formats
+                    accounts_list = []
+                    if hasattr(accounts, 'accounts'):
+                        accounts_list = accounts.accounts
+                    elif isinstance(accounts, dict) and 'accounts' in accounts:
+                        accounts_list = accounts['accounts']
+                    elif isinstance(accounts, list):
+                        accounts_list = accounts
+
+                    for account in accounts_list:
+                        try:
+                            # Handle different account object formats
+                            if hasattr(account, 'currency'):
+                                currency = account.currency
+                            elif isinstance(account, dict):
+                                currency = account.get('currency')
                             else:
-                                balance = float(account['available_balance'])
-                        elif 'balance' in account:
-                            balance = float(account['balance'])
-                    
-                    if balance > 0:
-                        # Convert to USD value
-                        if currency in ['USD', 'USDC']:
-                            usd_value = balance
-                        else:
-                            # Find corresponding price in crypto_data
-                            pair = f"{currency}-USDC"
-                            if pair in crypto_data and crypto_data[pair]['price'] > 0:
-                                usd_value = balance * crypto_data[pair]['price']
-                            else:
-                                usd_value = 0
-                        
-                        allocations[currency] = {
+                                continue
+
+                            # Get balance with different possible formats
+                            balance = 0
+                            if hasattr(account, 'available_balance'):
+                                if hasattr(account.available_balance, 'value'):
+                                    balance = float(account.available_balance.value)
+                                elif isinstance(account.available_balance, dict):
+                                    balance = float(account.available_balance.get('value', 0))
+                                elif isinstance(account.available_balance, (int, float, str)):
+                                    balance = float(account.available_balance)
+                            elif isinstance(account, dict):
+                                if 'available_balance' in account:
+                                    if isinstance(account['available_balance'], dict):
+                                        balance = float(account['available_balance'].get('value', 0))
+                                    else:
+                                        balance = float(account['available_balance'])
+                                elif 'balance' in account:
+                                    balance = float(account['balance'])
+
+                            if balance > 0:
+                                # Convert to USD value
+                                if currency in ['USD', 'USDC']:
+                                    usd_value = balance
+                                else:
+                                    # Find corresponding price in crypto_data
+                                    pair = f"{currency}-USDC"
+                                    if pair in crypto_data and crypto_data[pair]['price'] > 0:
+                                        usd_value = balance * crypto_data[pair]['price']
+                                    else:
+                                        usd_value = 0
+
+                                allocations[currency] = {
+                                    'balance': balance,
+                                    'usd_value': usd_value,
+                                    'percentage': 0  # Will calculate after getting total
+                                }
+                                total_value += usd_value
+
+                        except Exception as account_error:
+                            logging.debug(f"Error processing account: {account_error}")
+                            continue
+
+            # Get Kalshi positions
+            try:
+                if kalshi_engine and kalshi_engine.is_connected:
+                    # Get Kalshi balance
+                    kalshi_balance = kalshi_engine.get_balance()
+                    if kalshi_balance and kalshi_balance.get('balance', 0) > 0:
+                        balance = kalshi_balance['balance']
+                        allocations['KALSHI'] = {
                             'balance': balance,
-                            'usd_value': usd_value,
-                            'percentage': 0  # Will calculate after getting total
+                            'usd_value': balance,
+                            'percentage': 0
                         }
-                        total_value += usd_value
-                        
-                except Exception as account_error:
-                    logging.debug(f"Error processing account: {account_error}")
-                    continue
-            
+                        total_value += balance
+
+                    # Get Kalshi positions
+                    kalshi_positions = kalshi_engine.get_positions()
+                    if kalshi_positions:
+                        total_kalshi_value = sum(pos.get('current_value', 0) for pos in kalshi_positions)
+                        if total_kalshi_value > 0:
+                            # Add positions value to existing KALSHI allocation or create new one
+                            if 'KALSHI' in allocations:
+                                allocations['KALSHI']['balance'] += total_kalshi_value
+                                allocations['KALSHI']['usd_value'] += total_kalshi_value
+                            else:
+                                allocations['KALSHI'] = {
+                                    'balance': total_kalshi_value,
+                                    'usd_value': total_kalshi_value,
+                                    'percentage': 0
+                                }
+                            total_value += total_kalshi_value
+
+                        logging.info(f"Added {len(kalshi_positions)} Kalshi positions worth ${total_kalshi_value:.2f}")
+            except Exception as kalshi_error:
+                logging.warning(f"Could not fetch Kalshi positions: {kalshi_error}")
+
             # Calculate percentages
             for currency in allocations:
                 if total_value > 0:
                     allocations[currency]['percentage'] = (allocations[currency]['usd_value'] / total_value) * 100
-            
+
             portfolio_data.update({
                 'total_value': total_value,
                 'allocations': allocations,
                 'last_update': datetime.now().isoformat()
             })
-            
+
             logging.info(f"Portfolio breakdown: {len(allocations)} assets, total value: ${total_value:.2f}")
             return portfolio_data
-            
+
         except Exception as e:
             logging.error(f"Error getting portfolio breakdown: {e}")
             # Return a default portfolio with some sample data for testing
@@ -553,7 +717,8 @@ class TradingBotAdapter:
 
             # Determine the side and product_id
             side = action.upper()
-            product_id = symbol
+            # Convert -USDC to -USD for Coinbase API
+            product_id = symbol.replace('-USDC', '-USD')
 
             # The CDP service now expects the amount in the correct currency (quote for buy, base for sell)
             payload = {
@@ -595,7 +760,7 @@ class TradingBotAdapter:
         """Execute trade using Advanced Trade API with JWT authentication"""
         try:
             # Get current price for calculations
-            current_price = self._get_real_btc_price() if symbol == 'BTC-USDC' else 0
+            current_price = self._get_real_price(symbol)
             if current_price <= 0:
                 return {'success': False, 'error': 'Unable to get current price'}
             
@@ -617,9 +782,8 @@ class TradingBotAdapter:
             client_order_id = str(uuid.uuid4())
             
             # Map frontend symbol to Coinbase product ID
-            product_id = symbol
-            if symbol == 'BTC-USDC':
-                product_id = 'BTC-USD'  # Coinbase uses BTC-USD, not BTC-USDC
+            # Coinbase Advanced Trade uses -USD pairs, not -USDC
+            product_id = symbol.replace('-USDC', '-USD')
             
             # Prepare order body according to Coinbase API format
             order_body = {
@@ -707,7 +871,7 @@ class TradingBotAdapter:
         
         try:
             # Get current price for calculations
-            current_price = self._get_real_btc_price() if symbol == 'BTC-USDC' else 0
+            current_price = self._get_real_price(symbol)
             if current_price <= 0:
                 return {'success': False, 'error': 'Unable to get current price'}
             
@@ -739,9 +903,11 @@ class TradingBotAdapter:
                 }
             
             # Execute the order
+            # Map to Coinbase product ID format (-USD instead of -USDC)
+            product_id = symbol.replace('-USDC', '-USD')
             order_params = {
                 'client_order_id': client_order_id,
-                'product_id': symbol,
+                'product_id': product_id,
                 'side': action.upper(),
                 'order_configuration': order_config
             }
@@ -1423,9 +1589,24 @@ class TradingBotAdapter:
 # Initialize bot adapter
 bot_adapter = TradingBotAdapter()
 
+# Initialize auto trading engine (enhanced multi-currency only)
+# Create dummy legacy bot to avoid breaking old API endpoints (not used for trading)
+auto_trading_engine = AutoTradingEngine(bot_adapter)
+# Enhanced multi-currency bot is the ONLY active trading bot
+enhanced_engine = EnhancedAutoTradingEngine(bot_adapter)
+enhanced_engine.load_state()
+
 @app.route('/api/bot/status')
 def get_bot_status():
-    """Get current bot status"""
+    """Get current bot status with real-time P&L calculation"""
+    # Calculate real P&L from trade history
+    pnl_data = bot_adapter.calculate_pnl_from_trades()
+
+    # Update bot_data with calculated values
+    bot_data['daily_pnl'] = pnl_data['daily_pnl']
+    bot_data['total_pnl'] = pnl_data['total_pnl']
+    bot_data['daily_trades'] = pnl_data['daily_trades']
+
     return jsonify(bot_data)
 
 @app.route('/api/bot/start', methods=['POST'])
@@ -1666,8 +1847,8 @@ def get_quote():
                 'error': 'Coinbase client not initialized'
             }), 400
         
-        # Get current price
-        current_price = bot_adapter._get_real_btc_price() if symbol == 'BTC-USDC' else 0
+        # Get current price for any crypto
+        current_price = bot_adapter._get_real_price(symbol)
         
         if amount_type == 'usd':
             crypto_amount = amount / current_price if current_price > 0 else 0
@@ -2622,6 +2803,269 @@ def get_account_status_debug():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+# Auto Trading API Endpoints
+@app.route('/api/trading-strategies')
+@token_required
+def get_trading_strategies():
+    """Get available AI trading strategies"""
+    try:
+        strategies = auto_trading_engine.strategy_manager.get_available_strategies()
+        return jsonify({'success': True, 'strategies': strategies})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/set-trading-strategy', methods=['POST'])
+@token_required
+def set_trading_strategy():
+    """Set the active trading strategy"""
+    try:
+        data = request.json
+        strategy_id = data.get('strategy_id')
+        
+        logging.info(f"Setting strategy request: {strategy_id}")
+        
+        if not strategy_id:
+            return jsonify({'success': False, 'error': 'Strategy ID required'}), 400
+        
+        # Log available strategies
+        available = [s['id'] for s in auto_trading_engine.strategy_manager.get_available_strategies()]
+        logging.info(f"Available strategies: {available}")
+        
+        success = auto_trading_engine.set_strategy(strategy_id)
+        logging.info(f"Strategy set result: {success}")
+        logging.info(f"Engine active strategy after: {auto_trading_engine.state.active_strategy}")
+        
+        if success:
+            return jsonify({'success': True, 'message': f'Strategy set to {strategy_id}'})
+        else:
+            return jsonify({'success': False, 'error': 'Invalid strategy ID'}), 400
+            
+    except Exception as e:
+        logging.error(f"Exception in set_trading_strategy: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/trading-bot/<action>', methods=['POST'])
+@token_required
+def control_trading_bot(action):
+    """Control the auto trading bot (start/pause/stop)"""
+    try:
+        logging.info(f"Bot control request: {action}")
+        logging.info(f"Current bot status: {auto_trading_engine.state.status}")
+        logging.info(f"Current active strategy: {auto_trading_engine.state.active_strategy}")
+        
+        if action == 'start':
+            # Check if strategy is set before attempting to start
+            if not auto_trading_engine.state.active_strategy:
+                logging.error("Cannot start bot: No active strategy set")
+                return jsonify({'success': False, 'error': 'No active strategy selected. Please select a strategy first.'}), 400
+            
+            success = auto_trading_engine.start()
+            logging.info(f"Bot start result: {success}")
+        elif action == 'pause':
+            success = auto_trading_engine.pause()
+        elif action == 'stop':
+            success = auto_trading_engine.stop()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid action'}), 400
+        
+        if success:
+            logging.info(f"Bot {action} successful")
+            return jsonify({'success': True, 'message': f'Bot {action}ed successfully'})
+        else:
+            logging.error(f"Bot {action} failed")
+            return jsonify({'success': False, 'error': f'Failed to {action} bot'}), 400
+            
+    except Exception as e:
+        logging.error(f"Exception in control_trading_bot: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auto-trading-performance')
+@token_required
+def get_auto_trading_performance():
+    """Get auto trading performance stats"""
+    try:
+        status = auto_trading_engine.get_status()
+        return jsonify(status['performance'])
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/monitor')
+def mobile_monitor():
+    """Serve mobile monitoring page"""
+    return send_from_directory('.', 'mobile_monitor.html')
+
+@app.route('/api/bot-monitor')
+@token_required
+def get_bot_monitor():
+    """Get detailed bot monitoring data"""
+    try:
+        # Get full status
+        status = auto_trading_engine.get_status()
+        
+        # Add more details
+        monitor_data = {
+            'status': status['status'],
+            'strategy': status['active_strategy'],
+            'performance': status['performance'],
+            'price_history_count': len(auto_trading_engine.price_history),
+            'latest_price': auto_trading_engine.price_history[-1] if auto_trading_engine.price_history else None,
+            'thread_alive': auto_trading_engine.running_thread.is_alive() if auto_trading_engine.running_thread else False,
+            'last_signal': None,
+            'trade_history_count': len(auto_trading_engine.trade_history),
+            'check_interval': auto_trading_engine.check_interval,
+            'min_confidence': auto_trading_engine.min_confidence
+        }
+        
+        # Add last signal if exists
+        if auto_trading_engine.state.last_signal:
+            monitor_data['last_signal'] = auto_trading_engine._serialize_signal(auto_trading_engine.state.last_signal)
+        
+        # Add last few prices
+        if auto_trading_engine.price_history:
+            monitor_data['recent_prices'] = auto_trading_engine.price_history[-5:]
+        
+        return jsonify(monitor_data)
+    except Exception as e:
+        logging.error(f"Bot monitor error: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/current-trading-signal')
+@token_required
+def get_current_trading_signal():
+    """Get current AI trading signal"""
+    try:
+        status = auto_trading_engine.get_status()
+        signal = status.get('current_signal')
+        
+        # If no signal yet, return a default one
+        if not signal:
+            signal = {
+                'action': 'HOLD',
+                'confidence': 0,
+                'reason': 'Waiting for more market data...',
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        return jsonify({'success': True, 'signal': signal})
+    except Exception as e:
+        logging.error(f"Error getting current signal: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auto-trading-history')
+@token_required
+def get_auto_trading_history():
+    """Get auto trading history"""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        trades = auto_trading_engine.get_trading_history(limit)
+        return jsonify({'success': True, 'trades': trades})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/auto-trading-status')
+@token_required
+def get_auto_trading_status():
+    """Get complete auto trading status"""
+    try:
+        status = auto_trading_engine.get_status()
+        return jsonify({'success': True, **status})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# Enhanced Auto Trading Engine Endpoints
+@app.route('/api/enhanced-bot/status')
+@token_required
+def get_enhanced_bot_status():
+    """Get enhanced multi-currency bot status"""
+    try:
+        status = enhanced_engine.get_status()
+        return jsonify({'success': True, **status})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/enhanced-bot/start', methods=['POST'])
+@token_required
+def start_enhanced_bot():
+    """Start enhanced multi-currency trading bot"""
+    try:
+        success, message = enhanced_engine.start()
+        return jsonify({'success': success, 'message': message})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/enhanced-bot/stop', methods=['POST'])
+@token_required
+def stop_enhanced_bot():
+    """Stop enhanced multi-currency trading bot"""
+    try:
+        success, message = enhanced_engine.stop()
+        return jsonify({'success': success, 'message': message})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/enhanced-bot/toggle-currency', methods=['POST'])
+@token_required
+def toggle_currency():
+    """Enable/disable trading for a specific currency"""
+    try:
+        data = request.json
+        symbol = data.get('symbol')
+        enabled = data.get('enabled', True)
+
+        if not symbol:
+            return jsonify({'success': False, 'error': 'Symbol is required'}), 400
+
+        success, message = enhanced_engine.toggle_currency(symbol, enabled)
+        return jsonify({'success': success, 'message': message})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/enhanced-bot/trade-history')
+@token_required
+def get_enhanced_trade_history():
+    """Get recent trade history from enhanced bot"""
+    try:
+        limit = int(request.args.get('limit', 50))
+        trades = enhanced_engine.trade_history[-limit:]
+
+        # Convert to serializable format
+        trades_data = []
+        for trade in trades:
+            trades_data.append({
+                'id': trade.id,
+                'strategy': trade.strategy,
+                'symbol': trade.symbol,
+                'action': trade.action,
+                'amount_usd': trade.amount_usd,
+                'crypto_amount': trade.crypto_amount,
+                'price': trade.price,
+                'timestamp': trade.timestamp.isoformat(),
+                'status': trade.status,
+                'pnl': trade.pnl,
+                'reason': trade.reason
+            })
+
+        return jsonify({
+            'success': True,
+            'trades': trades_data,
+            'count': len(trades_data)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/enhanced-bot/sync-positions', methods=['POST'])
+@token_required
+def sync_positions():
+    """Manually sync existing Coinbase positions"""
+    try:
+        enhanced_engine.sync_existing_positions()
+        return jsonify({
+            'success': True,
+            'message': 'Positions synced successfully'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # Authentication endpoints
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -2699,10 +3143,2315 @@ def refresh():
 def verify_token_endpoint():
     """Verify if token is valid"""
     return jsonify({
-        'success': True, 
+        'success': True,
         'message': 'Token is valid',
         'user_id': request.current_user_id
     })
+
+# ============================================================================
+# POLYMARKET ENDPOINTS
+# ============================================================================
+
+# Initialize Polymarket engine (DISABLED - Not available in US)
+polymarket_engine = None
+# Polymarket is not available in the United States - skipping initialization
+logging.info("Polymarket engine disabled (not available in US)")
+
+@app.route('/api/polymarket/status')
+def polymarket_status():
+    """Get Polymarket connection status"""
+    try:
+        if polymarket_engine:
+            status = polymarket_engine.get_status()
+            return jsonify(status)
+        else:
+            return jsonify({
+                'connected': False,
+                'error': 'Polymarket engine not initialized'
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/markets')
+def polymarket_markets():
+    """Get active prediction markets"""
+    try:
+        limit = request.args.get('limit', 20, type=int)
+        if polymarket_engine:
+            markets = polymarket_engine.get_markets(limit=limit)
+            return jsonify({'markets': markets})
+        else:
+            return jsonify({'error': 'Polymarket engine not initialized'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/market/<condition_id>')
+def polymarket_market_details(condition_id):
+    """Get details for a specific market"""
+    try:
+        if polymarket_engine:
+            details = polymarket_engine.get_market_details(condition_id)
+            if details:
+                return jsonify(details)
+            else:
+                return jsonify({'error': 'Market not found'}), 404
+        else:
+            return jsonify({'error': 'Polymarket engine not initialized'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/balance')
+def polymarket_balance():
+    """Get USDC balance"""
+    try:
+        if polymarket_engine and polymarket_engine.is_connected:
+            balance = polymarket_engine.get_balance()
+            if balance:
+                return jsonify(balance)
+            else:
+                return jsonify({'error': 'Failed to fetch balance'}), 500
+        else:
+            return jsonify({'error': 'Not connected to Polymarket'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/positions')
+def polymarket_positions():
+    """Get current positions"""
+    try:
+        if polymarket_engine and polymarket_engine.is_connected:
+            positions = polymarket_engine.get_positions()
+            return jsonify({'positions': positions})
+        else:
+            return jsonify({'error': 'Not connected to Polymarket'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/order', methods=['POST'])
+def polymarket_place_order():
+    """Place an order on Polymarket"""
+    try:
+        if not polymarket_engine or not polymarket_engine.is_connected:
+            return jsonify({'error': 'Not connected to Polymarket'}), 401
+
+        data = request.json
+        token_id = data.get('token_id')
+        side = data.get('side')  # BUY or SELL
+        size = data.get('size')
+        price = data.get('price')
+        order_type = data.get('order_type', 'GTC')
+
+        if not all([token_id, side, size, price]):
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        result = polymarket_engine.place_order(
+            token_id=token_id,
+            side=side,
+            size=float(size),
+            price=float(price),
+            order_type=order_type
+        )
+
+        if result:
+            return jsonify({'success': True, 'order': result})
+        else:
+            return jsonify({'error': 'Failed to place order'}), 500
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/cancel-order', methods=['POST'])
+def polymarket_cancel_order():
+    """Cancel an order"""
+    try:
+        if not polymarket_engine or not polymarket_engine.is_connected:
+            return jsonify({'error': 'Not connected to Polymarket'}), 401
+
+        data = request.json
+        order_id = data.get('order_id')
+
+        if not order_id:
+            return jsonify({'error': 'order_id required'}), 400
+
+        success = polymarket_engine.cancel_order(order_id)
+
+        if success:
+            return jsonify({'success': True, 'message': 'Order cancelled'})
+        else:
+            return jsonify({'error': 'Failed to cancel order'}), 500
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/orderbook/<token_id>')
+def polymarket_orderbook(token_id):
+    """Get order book for a token"""
+    try:
+        if polymarket_engine:
+            orderbook = polymarket_engine.get_order_book(token_id)
+            if orderbook:
+                return jsonify(orderbook)
+            else:
+                return jsonify({'error': 'Failed to fetch order book'}), 500
+        else:
+            return jsonify({'error': 'Polymarket engine not initialized'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/polymarket/trades')
+def polymarket_trades():
+    """Get trade history"""
+    try:
+        if polymarket_engine and polymarket_engine.is_connected:
+            trades = polymarket_engine.get_trade_history()
+            return jsonify({'trades': trades})
+        else:
+            return jsonify({'error': 'Not connected to Polymarket'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# KALSHI ENDPOINTS (US-Legal Prediction Markets)
+# ============================================================================
+
+# Initialize Kalshi engine
+kalshi_engine = None
+try:
+    kalshi_engine = KalshiEngine()
+    logging.info("Kalshi engine initialized")
+except Exception as e:
+    logging.error(f"Failed to initialize Kalshi engine: {e}")
+
+@app.route('/api/kalshi/status')
+def kalshi_status():
+    """Get Kalshi connection status"""
+    try:
+        if kalshi_engine:
+            status = kalshi_engine.get_status()
+            return jsonify(status)
+        else:
+            return jsonify({
+                'connected': False,
+                'error': 'Kalshi engine not initialized'
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/markets')
+def kalshi_markets():
+    """Get active prediction markets"""
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        status = request.args.get('status', 'open')
+        min_volume = request.args.get('min_volume', 100, type=int)  # Require some volume to avoid resting orders
+
+        if kalshi_engine:
+            # First try to get crypto markets
+            logging.info("Fetching crypto markets...")
+            markets = kalshi_engine.get_markets(limit=limit, status=status, category='crypto', min_volume=0)
+
+            logging.info(f"Found {len(markets)} crypto markets")
+
+            # If no crypto markets found, get all markets with good liquidity
+            if len(markets) == 0:
+                logging.info("No crypto markets found, fetching all liquid markets")
+                markets = kalshi_engine.get_markets(limit=30, status=status, category=None, min_volume=min_volume)
+                logging.info(f"Found {len(markets)} liquid markets")
+
+            return jsonify({'markets': markets})
+        else:
+            return jsonify({'error': 'Kalshi engine not initialized'}), 500
+    except Exception as e:
+        logging.error(f"Error fetching markets: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/market/<ticker>')
+def kalshi_market_details(ticker):
+    """Get details for a specific market"""
+    try:
+        if kalshi_engine:
+            details = kalshi_engine.get_market_details(ticker)
+            if details:
+                return jsonify(details)
+            else:
+                return jsonify({'error': 'Market not found'}), 404
+        else:
+            return jsonify({'error': 'Kalshi engine not initialized'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/balance')
+def kalshi_balance():
+    """Get account balance"""
+    try:
+        if kalshi_engine and kalshi_engine.is_connected:
+            balance = kalshi_engine.get_balance()
+            if balance:
+                return jsonify(balance)
+            else:
+                return jsonify({'error': 'Failed to fetch balance'}), 500
+        else:
+            return jsonify({'error': 'Not connected to Kalshi'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/positions')
+def kalshi_positions():
+    """Get current positions"""
+    try:
+        if kalshi_engine and kalshi_engine.is_connected:
+            positions = kalshi_engine.get_positions()
+            return jsonify({'positions': positions})
+        else:
+            return jsonify({'error': 'Not connected to Kalshi'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/order', methods=['POST'])
+def kalshi_place_order():
+    """Place an order on Kalshi"""
+    try:
+        if not kalshi_engine or not kalshi_engine.is_connected:
+            return jsonify({'error': 'Not connected to Kalshi'}), 401
+
+        data = request.json
+        ticker = data.get('ticker')
+        side = data.get('side')  # yes or no
+        quantity = data.get('quantity')
+        price = data.get('price')  # in cents (1-99)
+
+        if not all([ticker, side, quantity, price]):
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        result = kalshi_engine.place_order(
+            ticker=ticker,
+            side=side,
+            quantity=int(quantity),
+            price=int(price)
+        )
+
+        if result:
+            return jsonify({'success': True, 'order': result})
+        else:
+            return jsonify({'error': 'Failed to place order'}), 500
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/cancel-order', methods=['POST'])
+def kalshi_cancel_order():
+    """Cancel an order"""
+    try:
+        if not kalshi_engine or not kalshi_engine.is_connected:
+            return jsonify({'error': 'Not connected to Kalshi'}), 401
+
+        data = request.json
+        order_id = data.get('order_id')
+
+        if not order_id:
+            return jsonify({'error': 'order_id required'}), 400
+
+        success = kalshi_engine.cancel_order(order_id)
+
+        if success:
+            return jsonify({'success': True, 'message': 'Order cancelled'})
+        else:
+            return jsonify({'error': 'Failed to cancel order'}), 500
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/kalshi/orders')
+def kalshi_orders():
+    """Get order history"""
+    try:
+        if kalshi_engine and kalshi_engine.is_connected:
+            ticker = request.args.get('ticker')
+            orders = kalshi_engine.get_orders(ticker=ticker)
+            return jsonify({'orders': orders})
+        else:
+            return jsonify({'error': 'Not connected to Kalshi'}), 401
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# KALSHI ML TRADING BOT ENDPOINTS
+# ============================================================================
+
+# Initialize ML trader (lazily)
+kalshi_ml_trader = None
+
+def get_kalshi_ml_trader():
+    """Get or create the Kalshi ML trader instance."""
+    global kalshi_ml_trader
+    if kalshi_ml_trader is None:
+        try:
+            kalshi_ml_trader = SmartKalshiTrader()
+            kalshi_ml_trader.initialize()
+            logging.info("Kalshi ML Trader initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize Kalshi ML Trader: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    return kalshi_ml_trader
+
+@app.route('/api/kalshi/opportunities')
+def get_kalshi_opportunities():
+    """
+    Get ML-analyzed Kalshi trading opportunities.
+
+    Returns:
+        {
+            "success": bool,
+            "btc_price": float,
+            "price_history": [...],  // Last 4 hours of BTC prices
+            "opportunities": [
+                {
+                    "ticker": str,
+                    "market_type": "range" | "threshold",
+                    "strike": float,           // Strike price or range midpoint
+                    "subtitle": str,           // Market description
+                    "market_odds": float,      // Current market price (0-100)
+                    "model_odds": float,       // Our model probability (0-100)
+                    "ev": float,               // Expected value (percentage points)
+                    "side": "YES" | "NO",      // Recommended side
+                    "hours_to_expiry": float,
+                    "volume": int,
+                    "yes_ask": int,            // Current YES ask in cents
+                    "no_ask": int,             // Current NO ask in cents
+                    "ml_score": float,         // ML confidence score
+                    "recommended": bool        // Passes all filters for trading
+                }
+            ],
+            "recommended_trades": [...],  // Opportunities that pass all filters
+            "timestamp": str
+        }
+    """
+    import requests as req
+    from datetime import datetime, timedelta
+
+    try:
+        # 1. Get current BTC price
+        try:
+            r = req.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10)
+            btc_price = float(r.json()['data']['amount'])
+        except:
+            btc_price = None
+
+        # 2. Get price history (last 4 hours)
+        price_history = []
+        try:
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=4)
+            url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+            params = {
+                'start': start_time.isoformat(),
+                'end': end_time.isoformat(),
+                'granularity': 300  # 5 minutes
+            }
+            r = req.get(url, params=params, timeout=30)
+            candles = r.json()
+            for c in sorted(candles, key=lambda x: x[0]):
+                price_history.append({
+                    'timestamp': c[0] * 1000,
+                    'price': c[4],
+                    'high': c[2],
+                    'low': c[1]
+                })
+        except Exception as e:
+            logging.warning(f"Failed to fetch price history: {e}")
+
+        # 3. Get ML trader and analyze markets
+        trader = get_kalshi_ml_trader()
+        if not trader:
+            return jsonify({
+                'success': False,
+                'error': 'ML Trader not initialized',
+                'btc_price': btc_price,
+                'price_history': price_history,
+                'opportunities': [],
+                'recommended_trades': []
+            })
+
+        # Update current price in trader
+        trader.current_price = btc_price
+
+        # Run ML analysis
+        raw_opportunities = trader.analyze_all_markets()
+
+        # Format opportunities for frontend
+        opportunities = []
+        recommended_trades = []
+
+        for opp in raw_opportunities:
+            # Convert numpy types to Python native types for JSON serialization
+            ev_val = float(opp.get('ev', 0))
+            ev_adj_val = float(opp.get('ev_adjusted', 0))
+
+            formatted = {
+                'ticker': opp.get('ticker', ''),
+                'market_type': opp.get('market_type', 'range'),
+                'strike': float(opp.get('strike', opp.get('lower', 0)) or 0),
+                'lower': float(opp.get('lower') or 0),
+                'upper': float(opp.get('upper') or 0) if opp.get('upper') else None,
+                'subtitle': opp.get('subtitle', ''),
+                'market_odds': float(round(opp.get('market_prob', 0) * 100, 1)),
+                'model_odds': float(round(opp.get('model_prob', 0) * 100, 1)),
+                'ev': float(round(ev_val * 100, 2)),  # Raw EV in percentage points
+                'side': opp.get('side', 'YES'),
+                'hours_to_expiry': float(round(opp.get('hours', 0), 1)),
+                'volume': int(opp.get('volume', 0)),
+                'yes_ask': int(opp.get('yes_ask', 0)),
+                'no_ask': int(opp.get('no_ask', 0)),
+                'ml_score': float(round(opp.get('ml_score', 0), 3)),
+                # QUANT-GRADE v2 metrics
+                'ev_raw': float(round(ev_val * 100, 2)),  # Raw EV (%)
+                'ev_adjusted': float(round(ev_adj_val, 2)),  # Risk-adjusted EV (σ units)
+                'ev_time_weighted': float(round(opp.get('ev_time_weighted', 0) * 100, 2)),  # Time-weighted EV (%)
+                'prob_uncertainty': float(round(opp.get('prob_uncertainty', 0.05) * 100, 1)),  # Model uncertainty (%)
+                'ml_size_multiplier': float(round(opp.get('ml_size_multiplier', 1.0), 2)),  # Position size scaler
+                'signal_confidence': float(round(opp.get('signal_confidence', 0.5), 2)),  # Signal agreement
+                'high_edge_override': bool(opp.get('high_edge_override', False)),  # Whether high edge override was used
+                # Filtering passes if: raw EV >= 1% AND risk-adjusted EV >= 0.5
+                'recommended': bool(ev_val >= 0.01 and ev_adj_val >= 0.5)
+            }
+            opportunities.append(formatted)
+
+            if formatted['recommended']:
+                recommended_trades.append(formatted)
+
+        # Sort by EV descending
+        opportunities.sort(key=lambda x: x['ev'], reverse=True)
+        recommended_trades.sort(key=lambda x: x['ev'], reverse=True)
+
+        # Build algorithm summary
+        signals = trader.signals or {}
+
+        # Import quant config values
+        from kalshi_ml_trader import (
+            MIN_EV_ADJUSTED, MIN_EV_RAW, MIN_ML_SCORE_HARD,
+            MIN_MODEL_PROB, MAX_MODEL_PROB, MIN_VOLUME
+        )
+
+        algorithm_summary = {
+            # Direction signals
+            'direction': signals.get('direction', 'NEUTRAL'),
+            'direction_score': round(signals.get('direction_score', 0), 3),
+            'rsi': round(signals.get('rsi', 50), 1),
+            'momentum_4h': round(signals.get('momentum_4h', 0) * 100, 2),  # As percentage
+            'momentum_24h': round(signals.get('momentum_24h', 0) * 100, 2),  # As percentage
+            'vol_regime': round(signals.get('vol_regime', 1.0), 3),
+            'funding_rate_bps': round(signals.get('funding_rate', 0) * 10000, 2),
+            'fear_greed': signals.get('fear_greed', 50),
+            'whale_activity': round(signals.get('whale_activity', 0), 3),
+            'garch_vol_annual': round(trader.vol_model.get_adjusted_vol(24) * 100, 1) if trader.vol_model else 0,
+
+            # QUANT-GRADE v2: Algorithm configuration
+            'quant_config': {
+                'min_ev_adjusted': MIN_EV_ADJUSTED,  # Risk-adjusted EV threshold (σ units)
+                'min_ev_raw': MIN_EV_RAW * 100,  # Raw EV threshold (%)
+                'min_ml_score': MIN_ML_SCORE_HARD,  # Hard ML floor
+                'min_prob': MIN_MODEL_PROB * 100,  # Min model probability (%)
+                'max_prob': MAX_MODEL_PROB * 100,  # Max model probability (%)
+                'min_volume': MIN_VOLUME,  # Volume filter
+                'approach': 'log-odds signal adjustment + risk-adjusted EV + time-weighted EV'
+            }
+        }
+
+        # Add enhanced data signals if available
+        if trader.enhanced_signals:
+            deribit = trader.enhanced_signals.get('deribit', {})
+            algorithm_summary['dvol'] = deribit.get('dvol', 0)
+            algorithm_summary['dvol_signal'] = deribit.get('signal', {}).get('direction', 'NEUTRAL')
+
+            oi = trader.enhanced_signals.get('open_interest', {})
+            algorithm_summary['open_interest_btc'] = round(oi.get('open_interest_btc', 0), 0)
+            algorithm_summary['long_short_ratio'] = round(oi.get('long_short_ratio', 1.0), 3)
+
+            ob = trader.enhanced_signals.get('orderbook', {})
+            algorithm_summary['orderbook_imbalance'] = round(ob.get('imbalance', 0) * 100, 1)
+
+        return jsonify({
+            'success': True,
+            'btc_price': btc_price,
+            'price_history': price_history,
+            'opportunities': opportunities,
+            'recommended_trades': recommended_trades,
+            'total_markets_scanned': len(raw_opportunities),
+            'algorithm_summary': algorithm_summary,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        logging.error(f"Error getting Kalshi opportunities: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/kalshi/execute-trades', methods=['POST'])
+def execute_kalshi_trades():
+    """
+    Execute recommended Kalshi trades.
+
+    Request body:
+        {
+            "trades": [...],      // List of trades to execute (from recommended_trades)
+            "dry_run": bool,      // If true, simulate without placing real orders
+            "max_risk": float     // Maximum total risk in dollars (default: 50)
+        }
+    """
+    try:
+        trader = get_kalshi_ml_trader()
+        if not trader:
+            return jsonify({'success': False, 'error': 'ML Trader not initialized'}), 500
+
+        data = request.get_json() or {}
+        trades = data.get('trades', [])
+        dry_run = data.get('dry_run', True)
+        max_risk = data.get('max_risk', 50.0)
+
+        if not trades:
+            return jsonify({'success': False, 'error': 'No trades provided'}), 400
+
+        # Execute trades
+        results = []
+        total_cost = 0
+
+        for trade in trades:
+            if total_cost >= max_risk:
+                break
+
+            ticker = trade.get('ticker')
+            side = trade.get('side', 'YES').lower()
+
+            # Calculate quantity based on remaining budget
+            remaining_budget = max_risk - total_cost
+
+            # Get price - try multiple field names for compatibility
+            if side == 'yes':
+                price_cents = trade.get('yes_ask') or trade.get('price') or trade.get('market_odds')
+            else:
+                price_cents = trade.get('no_ask') or trade.get('price') or (100 - trade.get('market_odds', 0))
+
+            logging.info(f"Trade data: ticker={ticker}, side={side}, price_cents={price_cents}, trade_data={trade}")
+
+            if not price_cents or price_cents <= 0:
+                logging.warning(f"Skipping trade {ticker}: invalid price {price_cents}")
+                results.append({
+                    'ticker': ticker,
+                    'side': side.upper(),
+                    'quantity': 0,
+                    'price_cents': price_cents,
+                    'status': 'failed',
+                    'error': f'Invalid price: {price_cents}'
+                })
+                continue
+
+            quantity = min(10, int(remaining_budget / (price_cents / 100)))  # Max 10 contracts per trade
+            if quantity <= 0:
+                continue
+
+            cost = quantity * (price_cents / 100)
+
+            if dry_run:
+                results.append({
+                    'ticker': ticker,
+                    'side': side.upper(),
+                    'quantity': quantity,
+                    'price_cents': price_cents,
+                    'cost': cost,
+                    'status': 'simulated',
+                    'ev': trade.get('ev', 0)
+                })
+            else:
+                # Execute real trade
+                try:
+                    logging.info(f"Placing order: {ticker} {side.upper()} x{quantity} @ {price_cents}c")
+                    order_result = trader.kalshi.place_order(
+                        ticker=ticker,
+                        side=side,
+                        quantity=quantity,
+                        price=int(price_cents),  # Price in cents
+                        order_type='limit'
+                    )
+                    if order_result:
+                        results.append({
+                            'ticker': ticker,
+                            'side': side.upper(),
+                            'quantity': quantity,
+                            'price_cents': price_cents,
+                            'cost': cost,
+                            'status': 'executed',
+                            'order_id': order_result.get('order', {}).get('order_id'),
+                            'ev': trade.get('ev', 0)
+                        })
+                    else:
+                        results.append({
+                            'ticker': ticker,
+                            'side': side.upper(),
+                            'quantity': quantity,
+                            'price_cents': price_cents,
+                            'status': 'failed',
+                            'error': 'Order returned None'
+                        })
+                except Exception as e:
+                    logging.error(f"Order failed for {ticker}: {e}")
+                    results.append({
+                        'ticker': ticker,
+                        'side': side.upper(),
+                        'quantity': quantity,
+                        'price_cents': price_cents,
+                        'status': 'failed',
+                        'error': str(e)
+                    })
+
+            total_cost += cost
+
+        return jsonify({
+            'success': True,
+            'dry_run': dry_run,
+            'trades_executed': len([r for r in results if r['status'] in ['executed', 'simulated']]),
+            'total_cost': total_cost,
+            'results': results,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        logging.error(f"Error executing Kalshi trades: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================================
+# BTC MONITOR ENDPOINT - Real-time position tracking
+# ============================================================================
+
+@app.route('/api/btc-monitor')
+def btc_monitor():
+    """
+    Get comprehensive BTC monitoring data:
+    - Real-time BTC price
+    - Historical price data (last 4 hours)
+    - Active Kalshi positions with analysis
+    - What needs to happen for each bet to win
+    """
+    import requests as req
+    from datetime import datetime, timedelta
+
+    try:
+        # 1. Get real-time BTC price from Coinbase
+        try:
+            r = req.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10)
+            btc_price = float(r.json()['data']['amount'])
+        except:
+            btc_price = None
+
+        # 2. Get historical BTC prices (last 4 hours, 5-min intervals)
+        price_history = []
+        try:
+            end_time = datetime.now()
+            start_time = end_time - timedelta(hours=4)
+            url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+            params = {
+                'start': start_time.isoformat(),
+                'end': end_time.isoformat(),
+                'granularity': 300  # 5 minutes
+            }
+            r = req.get(url, params=params, timeout=30)
+            candles = r.json()
+            # Format: [timestamp, low, high, open, close, volume]
+            for c in sorted(candles, key=lambda x: x[0]):
+                price_history.append({
+                    'timestamp': c[0] * 1000,  # Convert to milliseconds for JS
+                    'price': c[4],  # close price
+                    'high': c[2],
+                    'low': c[1]
+                })
+        except Exception as e:
+            logging.warning(f"Failed to fetch price history: {e}")
+
+        # 3. Get Kalshi positions
+        positions_data = []
+        total_cost = 0
+        total_potential_payout = 0
+
+        if kalshi_engine and kalshi_engine.is_connected:
+            try:
+                result = kalshi_engine._make_authenticated_request("GET", "/portfolio/positions")
+                if result and "market_positions" in result:
+                    now = datetime.now()
+
+                    for p in result["market_positions"]:
+                        ticker = p.get("ticker", "")
+                        pos = p.get("position", 0)
+
+                        # Only include KXBTC positions with active positions
+                        if "KXBTC" not in ticker or pos == 0:
+                            continue
+
+                        # Determine side: positive = YES, negative = NO
+                        side = "YES" if pos > 0 else "NO"
+                        abs_pos = abs(pos)
+
+                        # Detect market type:
+                        # KXBTCMAXY = yearly max (will BTC ever reach X this year)
+                        # KXBTCD = daily threshold (will BTC be above/below X at expiry)
+                        # KXBTC = range (will BTC be between X-Y at expiry)
+                        is_yearly_market = "KXBTCMAXY" in ticker
+                        is_threshold_market = "KXBTCD" in ticker
+
+                        # Parse ticker: KXBTC-26JAN1416-B97125 or KXBTCD-26JAN22-T104500 or KXBTCMAXY-26DEC31-199999.99
+                        ticker_parts = ticker.split('-')
+                        if len(ticker_parts) < 3:
+                            continue
+
+                        date_part = ticker_parts[1]  # e.g., "26JAN1416" or "26JAN22" or "26DEC31"
+                        strike_part = ticker_parts[2]  # e.g., "B97125" or "T104500" or "199999.99"
+
+                        # Parse expiry time
+                        try:
+                            year = int('20' + date_part[:2])
+                            month_str = date_part[2:5]
+                            day = int(date_part[5:7])
+                            hour = int(date_part[7:9]) if len(date_part) >= 9 else 16
+                            minute = int(date_part[9:11]) if len(date_part) >= 11 else 0
+
+                            months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                                     'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+                            month = months.get(month_str.upper(), 1)
+
+                            expiry = datetime(year, month, day, hour, minute)
+                            time_to_expiry = (expiry - now).total_seconds()
+
+                            # Create descriptive expiry string with full date
+                            today = now.date()
+                            tomorrow = today + timedelta(days=1)
+                            expiry_date = expiry.date()
+
+                            if is_yearly_market:
+                                # Yearly markets: show full date
+                                expiry_str = expiry.strftime('%b %d, %Y')
+                            elif expiry_date == today:
+                                # Today: "5:00 PM Today"
+                                expiry_str = expiry.strftime('%I:%M %p') + ' Today'
+                            elif expiry_date == tomorrow:
+                                # Tomorrow: "5:00 PM Tomorrow"
+                                expiry_str = expiry.strftime('%I:%M %p') + ' Tomorrow'
+                            elif time_to_expiry < 7 * 24 * 3600:
+                                # Within a week: "5:00 PM Wed Jan 24"
+                                expiry_str = expiry.strftime('%I:%M %p %a %b %d')
+                            else:
+                                # Further out: "Jan 24, 2026"
+                                expiry_str = expiry.strftime('%b %d, %Y')
+
+                            # Also store the full expiry datetime for filtering
+                            expiry_full = expiry.isoformat()
+                        except:
+                            time_to_expiry = 3600
+                            expiry_str = "Unknown"
+                            expiry_full = None
+
+                        # Parse strike/range based on market type
+                        lower = None
+                        upper = None
+                        threshold = None
+                        threshold_direction = None  # 'above' or 'below'
+                        market_type = 'range'
+
+                        if is_yearly_market:
+                            # KXBTCMAXY yearly markets: strike_part is just a number like "199999.99"
+                            # YES = BTC will reach this price at some point during the year
+                            # NO = BTC will NOT reach this price during the year
+                            market_type = 'yearly'
+                            try:
+                                threshold = float(strike_part)
+                                # For yearly max: YES wins if BTC ever reaches threshold, NO wins if it never does
+                                threshold_direction = 'above' if side == 'YES' else 'below'
+                            except:
+                                pass
+                        elif is_threshold_market:
+                            # KXBTCD threshold markets: T104500 = threshold at $104,500
+                            # YES = BTC ends above threshold, NO = BTC ends below threshold
+                            market_type = 'threshold'
+                            if strike_part.startswith('T'):
+                                try:
+                                    threshold = float(strike_part[1:])
+                                    # For threshold markets: YES wins if above, NO wins if below
+                                    threshold_direction = 'above' if side == 'YES' else 'below'
+                                except:
+                                    pass
+                        else:
+                            # KXBTC range markets: B97125 = range around $97,125
+                            market_type = 'range'
+                            if strike_part.startswith('B'):
+                                try:
+                                    strike = float(strike_part[1:])
+                                    lower = strike - 125
+                                    upper = strike + 125
+                                except:
+                                    pass
+
+                        # Calculate position metrics
+                        cost = p.get("total_traded", 0) / 100
+                        avg_price = cost / abs_pos if abs_pos > 0 else 0
+                        potential_payout = abs_pos * 1.0  # $1 per contract if wins
+
+                        total_cost += cost
+                        total_potential_payout += potential_payout
+
+                        # Determine status and what needs to happen
+                        in_range = False
+                        distance = None
+                        what_needs_to_happen = ""
+
+                        if is_yearly_market and btc_price and threshold:
+                            # Yearly max market logic
+                            # YES wins if BTC ever reaches threshold during the year
+                            # NO wins if BTC never reaches threshold
+                            distance = threshold - btc_price
+                            if threshold_direction == 'above':
+                                # Betting YES that BTC will reach this price
+                                if btc_price >= threshold:
+                                    in_range = True
+                                    what_needs_to_happen = f"BTC already reached ${threshold:,.0f}! Waiting for settlement."
+                                else:
+                                    what_needs_to_happen = f"BTC needs to reach ${threshold:,.0f} anytime before expiry (${distance:,.0f} away)"
+                            else:
+                                # Betting NO that BTC will NOT reach this price
+                                if btc_price >= threshold:
+                                    what_needs_to_happen = f"BTC already hit ${threshold:,.0f} - bet lost unless it settles differently"
+                                else:
+                                    in_range = True
+                                    what_needs_to_happen = f"BTC must stay below ${threshold:,.0f} until expiry (${distance:,.0f} buffer)"
+                        elif is_threshold_market and btc_price and threshold:
+                            # Threshold market logic
+                            if threshold_direction == 'above':
+                                # Bet wins if BTC ends above threshold
+                                if btc_price > threshold:
+                                    in_range = True
+                                    distance = btc_price - threshold
+                                    what_needs_to_happen = f"BTC stays above ${threshold:,.0f} (currently +${distance:,.0f})"
+                                else:
+                                    distance = threshold - btc_price
+                                    what_needs_to_happen = f"BTC rises ${distance:,.0f} above ${threshold:,.0f}"
+                            else:
+                                # Bet wins if BTC ends below threshold
+                                if btc_price < threshold:
+                                    in_range = True
+                                    distance = threshold - btc_price
+                                    what_needs_to_happen = f"BTC stays below ${threshold:,.0f} (currently -${distance:,.0f})"
+                                else:
+                                    distance = btc_price - threshold
+                                    what_needs_to_happen = f"BTC falls ${distance:,.0f} below ${threshold:,.0f}"
+                        elif btc_price and lower and upper:
+                            # Range market logic
+                            if lower <= btc_price < upper:
+                                in_range = True
+                                what_needs_to_happen = f"BTC stays between ${lower:,.0f}-${upper:,.0f}"
+                                distance = 0
+                            elif btc_price < lower:
+                                distance = lower - btc_price
+                                what_needs_to_happen = f"BTC needs to rise ${distance:,.0f} to ${lower:,.0f}"
+                            else:
+                                distance = btc_price - upper
+                                what_needs_to_happen = f"BTC needs to fall ${distance:,.0f} to ${upper:,.0f}"
+
+                        positions_data.append({
+                            'ticker': ticker,
+                            'quantity': abs_pos,
+                            'side': side,
+                            'market_type': market_type,
+                            'lower': lower,
+                            'upper': upper,
+                            'threshold': threshold,
+                            'threshold_direction': threshold_direction,
+                            'cost': cost,
+                            'avg_price_cents': int(avg_price * 100),
+                            'potential_payout': potential_payout,
+                            'expiry': expiry_str,
+                            'expiry_full': expiry_full if 'expiry_full' in dir() else None,
+                            'time_to_expiry_seconds': max(0, time_to_expiry),
+                            'in_range': in_range,
+                            'distance': distance,
+                            'what_needs_to_happen': what_needs_to_happen,
+                        })
+
+                    # Sort by expiry time
+                    positions_data.sort(key=lambda x: x['time_to_expiry_seconds'])
+
+            except Exception as e:
+                logging.error(f"Failed to fetch Kalshi positions: {e}")
+
+        # 4. Calculate summary stats
+        winning_positions = [p for p in positions_data if p['in_range']]
+        winning_payout = sum(p['potential_payout'] for p in winning_positions)
+
+        return jsonify({
+            'btc_price': btc_price,
+            'price_history': price_history,
+            'positions': positions_data,
+            'summary': {
+                'total_positions': len(positions_data),
+                'total_cost': total_cost,
+                'total_potential_payout': total_potential_payout,
+                'winning_positions': len(winning_positions),
+                'current_winning_payout': winning_payout,
+                'current_pnl': winning_payout - total_cost if winning_positions else -total_cost,
+            },
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        logging.error(f"BTC monitor error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# DEBUG: Raw Kalshi API data endpoint
+# ============================================================================
+
+@app.route('/api/kalshi/debug-data')
+def kalshi_debug_data():
+    """Debug endpoint to see raw Kalshi API responses"""
+    result = {
+        'kalshi_connected': kalshi_engine.is_connected if kalshi_engine else False,
+        'fills': None,
+        'settlements': None,
+        'positions': None,
+        'orders': None,
+    }
+
+    if kalshi_engine and kalshi_engine.is_connected:
+        try:
+            fills_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/fills?limit=100')
+            result['fills'] = fills_result
+        except Exception as e:
+            result['fills_error'] = str(e)
+
+        try:
+            settlements_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/settlements?limit=100')
+            result['settlements'] = settlements_result
+        except Exception as e:
+            result['settlements_error'] = str(e)
+
+        try:
+            positions_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/positions')
+            result['positions'] = positions_result
+        except Exception as e:
+            result['positions_error'] = str(e)
+
+        try:
+            orders_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/orders?limit=100')
+            result['orders'] = orders_result
+        except Exception as e:
+            result['orders_error'] = str(e)
+
+    return jsonify(result)
+
+# ============================================================================
+# ALGORITHM ANALYTICS ENDPOINT
+# ============================================================================
+
+@app.route('/api/algorithm/analytics')
+def algorithm_analytics():
+    """
+    Get comprehensive algorithm performance analytics from REAL Kalshi data:
+    - Sharpe ratio, win rate, profit factor
+    - Equity curve
+    - Daily returns distribution
+    - Model calibration
+    - Signal performance breakdown
+    """
+    from datetime import datetime, timedelta
+    from collections import defaultdict
+    import math
+
+    timeframe = request.args.get('timeframe', '7d')
+
+    try:
+        from datetime import timezone
+        now_utc = datetime.now(timezone.utc)
+
+        # Determine date range (in UTC)
+        if timeframe == '24h':
+            start_date = now_utc - timedelta(days=1)
+        elif timeframe == '7d':
+            start_date = now_utc - timedelta(days=7)
+        elif timeframe == '30d':
+            start_date = now_utc - timedelta(days=30)
+        else:  # 'all'
+            start_date = now_utc - timedelta(days=365)
+
+        now = datetime.now()  # Keep local time for display
+        logging.info(f"Analytics request: timeframe={timeframe}, start_date={start_date.isoformat()}")
+
+        # =====================================================
+        # FETCH REAL DATA FROM KALSHI API
+        # =====================================================
+        fills = []
+        orders = []
+        positions = []
+        settlements = []
+
+        if kalshi_engine and kalshi_engine.is_connected:
+            # Get fills (executed trades) - fetch more to ensure we get all
+            try:
+                fills_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/fills?limit=1000')
+                logging.info(f"Fills API raw result keys: {fills_result.keys() if fills_result else 'None'}")
+                if fills_result:
+                    # Log the raw structure to understand it
+                    logging.info(f"Fills result structure: {list(fills_result.keys())}")
+                    if 'fills' in fills_result:
+                        fills = fills_result['fills']
+                        logging.info(f"Fetched {len(fills)} fills from Kalshi API")
+                        if fills:
+                            logging.info(f"Sample fill structure: {fills[0]}")
+                    else:
+                        # Maybe the data is under a different key
+                        logging.info(f"No 'fills' key, checking other keys: {fills_result}")
+            except Exception as e:
+                logging.warning(f"Could not fetch fills: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # Get orders
+            try:
+                orders_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/orders?limit=1000')
+                if orders_result and 'orders' in orders_result:
+                    orders = orders_result['orders']
+                    logging.info(f"Fetched {len(orders)} orders from Kalshi")
+            except Exception as e:
+                logging.warning(f"Could not fetch orders: {e}")
+
+            # Get current positions
+            try:
+                positions_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/positions')
+                if positions_result and 'market_positions' in positions_result:
+                    positions = positions_result['market_positions']
+                    logging.info(f"Fetched {len(positions)} positions from Kalshi")
+            except Exception as e:
+                logging.warning(f"Could not fetch positions: {e}")
+
+            # Get settlements (resolved trades)
+            try:
+                settlements_result = kalshi_engine._make_authenticated_request('GET', '/portfolio/settlements?limit=1000')
+                logging.info(f"Settlements API raw result keys: {settlements_result.keys() if settlements_result else 'None'}")
+                if settlements_result:
+                    logging.info(f"Settlements result structure: {list(settlements_result.keys())}")
+                    if 'settlements' in settlements_result:
+                        settlements = settlements_result['settlements']
+                        logging.info(f"Fetched {len(settlements)} settlements from Kalshi")
+                        if settlements:
+                            logging.info(f"Sample settlement structure: {settlements[0]}")
+                    else:
+                        logging.info(f"No 'settlements' key, raw data: {settlements_result}")
+            except Exception as e:
+                logging.warning(f"Could not fetch settlements: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # =====================================================
+        # LOAD TRADE LOG FOR MODEL_PROB AND EV DATA
+        # =====================================================
+        trade_log = {}
+        try:
+            from hedge_engine import HedgeEngine
+            log_entries = HedgeEngine.load_trade_log()
+            # Index by ticker for quick lookup
+            for entry in log_entries:
+                ticker = entry.get('ticker', '')
+                if ticker:
+                    trade_log[ticker] = {
+                        'model_prob': entry.get('model_prob', 0),
+                        'market_prob': entry.get('market_prob', 0),
+                        'ev': entry.get('ev', 0)
+                    }
+            logging.info(f"Loaded {len(trade_log)} entries from trade log")
+        except Exception as e:
+            logging.warning(f"Could not load trade log: {e}")
+
+        # =====================================================
+        # PROCESS SETTLEMENTS INTO TRADES (primary data source)
+        # Settlements show completed trades with outcomes - this matches Kalshi portfolio page
+        # =====================================================
+        trades = []
+        skipped_count = 0
+
+        # Process settlements as primary trade source
+        for s in settlements:
+            try:
+                # Get settlement time - try multiple field names
+                settled_time = s.get('settled_time') or s.get('settlement_time') or s.get('created_time') or ''
+
+                # Parse the settlement date properly (Kalshi uses UTC)
+                settle_date = None
+                if settled_time:
+                    try:
+                        if settled_time.endswith('Z'):
+                            settle_date = datetime.fromisoformat(settled_time.replace('Z', '+00:00'))
+                        else:
+                            settle_date = datetime.fromisoformat(settled_time)
+                    except Exception as e:
+                        logging.warning(f"Could not parse settlement time '{settled_time}': {e}")
+
+                    if settle_date:
+                        # Make sure settle_date is timezone-aware for comparison
+                        if settle_date.tzinfo is None:
+                            settle_date = settle_date.replace(tzinfo=timezone.utc)
+
+                        # Compare UTC to UTC
+                        if settle_date < start_date:
+                            skipped_count += 1
+                            continue
+
+                ticker = s.get('ticker', '')
+                market_result = s.get('market_result', s.get('result', ''))
+                revenue = (s.get('revenue', 0) or 0) / 100.0  # Convert cents to dollars
+
+                # Get position info - try multiple field names
+                # Kalshi settlements may include: yes_count/no_count OR count with side
+                yes_count = s.get('yes_count', 0) or 0
+                no_count = s.get('no_count', 0) or 0
+
+                # Also check for alternative field structure
+                if yes_count == 0 and no_count == 0:
+                    count = s.get('count', 0) or 0
+                    side_field = s.get('side', '').upper()
+                    if side_field == 'YES':
+                        yes_count = count
+                    elif side_field == 'NO':
+                        no_count = count
+
+                # Determine side and quantity from position
+                # Settlements have yes_total_cost/no_total_cost (total cost in cents), not per-contract price
+                if yes_count > 0:
+                    side = 'YES'
+                    quantity = yes_count
+                    yes_total_cost = s.get('yes_total_cost', 0) or 0
+                    entry_price = (yes_total_cost / yes_count) / 100.0 if yes_count > 0 else 0
+                elif no_count > 0:
+                    side = 'NO'
+                    quantity = no_count
+                    no_total_cost = s.get('no_total_cost', 0) or 0
+                    entry_price = (no_total_cost / no_count) / 100.0 if no_count > 0 else 0
+                else:
+                    # Try to infer from revenue - if we got paid, we had a position
+                    if revenue > 0:
+                        # We won something, try to figure out what
+                        quantity = 1
+                        side = 'YES' if market_result.lower() == 'yes' else 'NO'
+                        entry_price = 0.5  # Default estimate
+                    else:
+                        # Skip if no position info
+                        logging.debug(f"Skipping settlement with no position info: {s}")
+                        continue
+
+                cost = quantity * entry_price if entry_price else revenue * 0.5  # Estimate if no price
+
+                # Determine win/loss from market_result and side
+                # If market_result is 'yes', YES bets won. If 'no', NO bets won.
+                if market_result.lower() == 'yes':
+                    won = (side == 'YES')
+                elif market_result.lower() == 'no':
+                    won = (side == 'NO')
+                else:
+                    # Try to infer from revenue
+                    won = revenue > cost if cost > 0 else revenue > 0
+
+                # Calculate P&L
+                if won is True:
+                    pnl = revenue - cost if cost > 0 else quantity * 1.0 - cost
+                elif won is False:
+                    pnl = -cost if cost > 0 else -revenue
+                else:
+                    pnl = revenue - cost
+
+                # Determine if this was a BTC market
+                is_btc = 'KXBTC' in ticker
+
+                # Get model_prob and EV from trade log if available
+                market_prob = entry_price  # Entry price IS market probability
+
+                if ticker in trade_log:
+                    # Use recorded values from trade execution
+                    log_entry = trade_log[ticker]
+                    model_prob = log_entry.get('model_prob', 0)
+                    ev = log_entry.get('ev', 0)
+                else:
+                    # Estimate: our strategy targets 4-8% edge, use 5% baseline
+                    EDGE_THRESHOLD = 0.05
+                    model_prob = min(0.99, max(0.01, market_prob + EDGE_THRESHOLD))
+                    ev = model_prob - market_prob
+
+                trades.append({
+                    'time': settled_time,
+                    'ticker': ticker,
+                    'side': side,
+                    'quantity': quantity,
+                    'price': entry_price,
+                    'cost': cost,
+                    'is_btc': is_btc,
+                    'settled': True,
+                    'won': won,
+                    'pnl': pnl,
+                    'revenue': revenue,
+                    'market_result': market_result,
+                    'model_prob': model_prob,
+                    'market_prob': market_prob,
+                    'ev': ev,
+                })
+            except Exception as e:
+                logging.warning(f"Error processing settlement: {e}, settlement data: {s}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # Also add current positions as pending trades
+        for p in positions:
+            try:
+                ticker = p.get('ticker', '')
+                position = p.get('position', 0)
+
+                if position == 0:
+                    continue
+
+                # Positive position = YES, negative = NO
+                side = 'YES' if position > 0 else 'NO'
+                quantity = abs(position)
+
+                # Get market info for entry price estimate
+                market_exposure = p.get('market_exposure', 0) / 100.0
+                resting_order_count = p.get('resting_order_count', 0)
+
+                # Estimate entry price from exposure/position
+                entry_price = market_exposure / quantity if quantity > 0 and market_exposure > 0 else 0.5
+                cost = market_exposure if market_exposure > 0 else quantity * 0.5
+
+                is_btc = 'KXBTC' in ticker
+
+                # Get model_prob and EV from trade log if available
+                market_prob = entry_price
+                if ticker in trade_log:
+                    log_entry = trade_log[ticker]
+                    model_prob = log_entry.get('model_prob', 0)
+                    ev = log_entry.get('ev', 0)
+                else:
+                    EDGE_THRESHOLD = 0.05
+                    model_prob = min(0.99, max(0.01, market_prob + EDGE_THRESHOLD))
+                    ev = model_prob - market_prob
+
+                trades.append({
+                    'time': datetime.now(timezone.utc).isoformat(),
+                    'ticker': ticker,
+                    'side': side,
+                    'quantity': quantity,
+                    'price': entry_price,
+                    'cost': cost,
+                    'is_btc': is_btc,
+                    'settled': False,
+                    'won': None,
+                    'pnl': 0,
+                    'model_prob': model_prob,
+                    'market_prob': market_prob,
+                    'ev': ev,
+                })
+            except Exception as e:
+                logging.warning(f"Error processing position: {e}, position data: {p}")
+                continue
+
+        logging.info(f"Processed {len(trades)} trades from {len(settlements)} settlements + {len(positions)} positions (skipped {skipped_count} outside timeframe)")
+
+        # =====================================================
+        # COUNT WINS/LOSSES FROM PROCESSED TRADES
+        # (P&L already calculated from settlements above)
+        # =====================================================
+        total_cost = 0
+        total_revenue = 0
+        wins = 0
+        losses = 0
+        pending = 0
+
+        for trade in trades:
+            total_cost += trade.get('cost', 0)
+
+            if trade.get('settled'):
+                if trade.get('won') is True:
+                    wins += 1
+                    total_revenue += trade.get('revenue', trade.get('quantity', 0) * 1.0)
+                elif trade.get('won') is False:
+                    losses += 1
+                pending += 1
+
+        logging.info(f"Counted from trades: wins={wins}, losses={losses}, pending={pending}, total_cost=${total_cost:.2f}")
+
+        # =====================================================
+        # CALCULATE METRICS
+        # =====================================================
+        total_trades = len(trades)
+        settled_trades = wins + losses
+
+        logging.info(f"Trade stats: total={total_trades}, wins={wins}, losses={losses}, pending={pending}")
+
+        # Win rate (only from settled trades)
+        win_rate = wins / settled_trades if settled_trades > 0 else 0
+        logging.info(f"Win rate: {win_rate:.2%} ({wins}/{settled_trades})")
+
+        # P&L
+        gross_profit = sum(t['pnl'] for t in trades if t.get('pnl', 0) > 0)
+        gross_loss = abs(sum(t['pnl'] for t in trades if t.get('pnl', 0) < 0))
+        total_pnl = gross_profit - gross_loss
+
+        # Profit factor (cap at 999.99 to avoid JSON Infinity issue)
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else (999.99 if gross_profit > 0 else 0)
+
+        # Calculate daily P&L for equity curve and Sharpe
+        daily_pnl = defaultdict(float)
+        for trade in trades:
+            if trade.get('settled'):
+                try:
+                    trade_date = datetime.fromisoformat(trade['time'].replace('Z', '+00:00')).strftime('%Y-%m-%d')
+                    daily_pnl[trade_date] += trade.get('pnl', 0)
+                except:
+                    pass
+
+        # Sharpe ratio calculation
+        returns = list(daily_pnl.values())
+        if len(returns) > 1:
+            avg_return = sum(returns) / len(returns)
+            variance = sum((r - avg_return) ** 2 for r in returns) / len(returns)
+            std_return = math.sqrt(variance) if variance > 0 else 0
+            sharpe_ratio = (avg_return / std_return) * math.sqrt(252) if std_return > 0 else 0
+        else:
+            sharpe_ratio = 0
+            avg_return = returns[0] if returns else 0
+
+        # ROI
+        roi = total_pnl / total_cost if total_cost > 0 else 0
+
+        # =====================================================
+        # BUILD EQUITY CURVE FROM REAL DATA
+        # =====================================================
+        equity_curve = []
+        initial_equity = 100.0  # Starting reference
+        running_equity = initial_equity
+
+        # Sort daily P&L by date
+        sorted_dates = sorted(daily_pnl.keys())
+        for date in sorted_dates:
+            running_equity += daily_pnl[date]
+            equity_curve.append({
+                'date': datetime.strptime(date, '%Y-%m-%d').strftime('%m/%d'),
+                'equity': round(running_equity, 2)
+            })
+
+        # If no equity curve data, create a simple one
+        if not equity_curve:
+            equity_curve = [{'date': now.strftime('%m/%d'), 'equity': initial_equity + total_pnl}]
+
+        # Max drawdown
+        peak = initial_equity
+        max_dd = 0
+        for point in equity_curve:
+            if point['equity'] > peak:
+                peak = point['equity']
+            dd = (peak - point['equity']) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+
+        # =====================================================
+        # BUILD DAILY RETURNS
+        # =====================================================
+        daily_returns = []
+        prev_equity = initial_equity
+        for point in equity_curve:
+            ret = (point['equity'] - prev_equity) / prev_equity if prev_equity > 0 else 0
+            daily_returns.append({
+                'date': point['date'],
+                'return': round(ret, 4)
+            })
+            prev_equity = point['equity']
+
+        # =====================================================
+        # WIN RATE OVER TIME (rolling window)
+        # =====================================================
+        win_rate_over_time = []
+        settled_list = [t for t in trades if t.get('settled')]
+        window_size = min(20, max(5, len(settled_list) // 4))
+
+        for i in range(window_size, len(settled_list) + 1, max(1, len(settled_list) // 10)):
+            window = settled_list[max(0, i-window_size):i]
+            window_wins = sum(1 for t in window if t.get('won'))
+            wr = window_wins / len(window) if window else 0
+            win_rate_over_time.append({
+                'trade_num': i,
+                'win_rate': round(wr, 3)
+            })
+
+        # =====================================================
+        # MODEL CALIBRATION (from actual predictions vs outcomes)
+        # =====================================================
+        # Group trades by predicted probability buckets
+        calibration_buckets = defaultdict(lambda: {'predicted_sum': 0, 'actual_sum': 0, 'count': 0})
+
+        for trade in trades:
+            if trade.get('settled') and 'model_prob' in trade:
+                prob = trade['model_prob']
+                bucket_idx = min(9, int(prob * 10))
+                bucket_name = f"{bucket_idx*10}-{(bucket_idx+1)*10}%"
+                calibration_buckets[bucket_name]['predicted_sum'] += prob
+                calibration_buckets[bucket_name]['actual_sum'] += 1 if trade.get('won') else 0
+                calibration_buckets[bucket_name]['count'] += 1
+
+        model_calibration = []
+        for i in range(10):
+            bucket = f"{i*10}-{(i+1)*10}%"
+            if calibration_buckets[bucket]['count'] > 0:
+                predicted = calibration_buckets[bucket]['predicted_sum'] / calibration_buckets[bucket]['count']
+                actual = calibration_buckets[bucket]['actual_sum'] / calibration_buckets[bucket]['count']
+            else:
+                predicted = (i + 0.5) / 10
+                actual = predicted  # No data, assume calibrated
+            model_calibration.append({
+                'predicted_bucket': bucket,
+                'predicted': round(predicted, 2),
+                'actual': round(actual, 2)
+            })
+
+        # =====================================================
+        # SIGNAL PERFORMANCE
+        # For now, show aggregate stats since we don't track which signal triggered each trade
+        # In production, this would require logging the signal at trade execution time
+        # =====================================================
+        # Calculate overall stats that we can derive from real data
+        avg_entry_price = sum(t.get('price', 0) for t in settled_list) / len(settled_list) if settled_list else 0
+        avg_trade_ev = sum(t.get('ev', 0) for t in settled_list) / len(settled_list) if settled_list else 0
+
+        # Show one "Combined Model" entry with real aggregate data
+        signal_performance = {
+            'Combined Model': {
+                'trades': settled_trades,
+                'win_rate': round(win_rate, 3),
+                'avg_ev': round(avg_trade_ev, 4),  # Actual EV (model_prob - market_prob)
+                'pnl': round(total_pnl, 2),
+                'contribution': 1.0
+            }
+        }
+
+        # Note: To get per-signal breakdown, need to log signal info at trade execution time
+
+        # =====================================================
+        # RECENT TRADES
+        # =====================================================
+        recent_trades = []
+        total_ev = 0
+        for trade in sorted(trades, key=lambda x: x.get('time', ''), reverse=True)[:20]:
+            try:
+                time_str = datetime.fromisoformat(trade['time'].replace('Z', '+00:00')).strftime('%m/%d %H:%M')
+            except:
+                time_str = trade.get('time', '')[:16]
+
+            model_prob = trade.get('model_prob', 0)
+            market_prob = trade.get('market_prob', trade.get('price', 0))
+            ev = trade.get('ev', model_prob - market_prob if model_prob > 0 else 0)
+            total_ev += ev
+
+            recent_trades.append({
+                'time': time_str,
+                'ticker': trade['ticker'],
+                'side': trade['side'],
+                'quantity': trade['quantity'],
+                'price': trade['price'],
+                'cost': round(trade['cost'], 2),
+                'model_prob': round(model_prob, 4),
+                'market_prob': round(market_prob, 4),
+                'ev': round(ev, 4),
+                'settled': trade['settled'],
+                'won': trade.get('won'),
+                'pnl': round(trade.get('pnl', 0), 2)
+            })
+
+        # Calculate derived metrics
+        current_equity = initial_equity + total_pnl
+
+        # Average EV per trade (sum of edge we targeted across ALL trades, not just recent)
+        all_trades_ev = sum(t.get('ev', 0) for t in trades)
+        avg_ev = all_trades_ev / len(trades) if trades else 0
+
+        return jsonify({
+            'summary': {
+                'sharpe_ratio': round(sharpe_ratio, 2),
+                'win_rate': round(win_rate, 3),
+                'total_trades': total_trades,
+                'total_pnl': round(total_pnl, 2),
+                'roi': round(roi, 4),
+                'max_drawdown': round(-max_dd, 4),
+                'profit_factor': round(profit_factor, 2),
+                'avg_ev_per_trade': round(avg_ev, 4),
+                'initial_equity': initial_equity,
+                'current_equity': round(current_equity, 2)
+            },
+            'equity_curve': equity_curve,
+            'daily_returns': daily_returns,
+            'win_rate_over_time': win_rate_over_time,
+            'model_calibration': model_calibration,
+            'signal_performance': signal_performance,
+            'recent_trades': recent_trades,
+            'timeframe': timeframe,
+            'generated_at': now.isoformat()
+        })
+
+    except Exception as e:
+        logging.error(f"Algorithm analytics error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# BTC HEDGING ENDPOINTS (Linear Programming Optimization)
+# ============================================================================
+
+# Initialize Hedge engine
+hedge_engine = None
+try:
+    hedge_engine = HedgeEngine()
+    logging.info("Hedge engine initialized")
+except Exception as e:
+    logging.error(f"Failed to initialize Hedge engine: {e}")
+
+@app.route('/api/hedge/status')
+def hedge_status():
+    """Get current hedge status including portfolio and active positions"""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        status = hedge_engine.get_hedge_status()
+        return jsonify(status)
+    except Exception as e:
+        logging.error(f"Error getting hedge status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hedge/optimize', methods=['POST'])
+def hedge_optimize():
+    """
+    Optimize the BTC hedge ladder using linear programming.
+
+    Request body:
+        {
+            "budget_pct": 0.02,  // Monthly budget as % of notional (default 2%)
+            "target_coverage": 0.68,  // Target cents on dollar at min_coverage_drawdown
+            "min_coverage_drawdown": -0.20,  // Drawdown level for target coverage (default -20%)
+            "min_volume": 100  // Minimum market volume filter
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        budget_pct = data.get('budget_pct', 0.02)
+        target_coverage = data.get('target_coverage', 0.68)
+        min_coverage_drawdown = data.get('min_coverage_drawdown', -0.20)
+        min_volume = data.get('min_volume', 100)
+
+        logging.info(f"Optimizing hedge with budget={budget_pct*100:.1f}%, target={target_coverage*100:.0f}% @ {min_coverage_drawdown*100:.0f}%")
+
+        result = hedge_engine.optimize_hedge(
+            budget_pct=budget_pct,
+            target_coverage=target_coverage,
+            min_coverage_drawdown=min_coverage_drawdown,
+            min_volume=min_volume
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error optimizing hedge: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/execute', methods=['POST'])
+def hedge_execute():
+    """
+    Execute the optimized hedge by placing orders on Kalshi.
+
+    Request body:
+        {
+            "optimization_result": {...},  // Result from /api/hedge/optimize
+            "dry_run": true  // If true, simulate without placing real orders
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        optimization_result = data.get('optimization_result')
+        dry_run = data.get('dry_run', True)
+
+        if not optimization_result:
+            return jsonify({'error': 'optimization_result is required'}), 400
+
+        logging.info(f"Executing hedge (dry_run={dry_run})")
+
+        result = hedge_engine.execute_hedge(
+            optimization_result=optimization_result,
+            dry_run=dry_run
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error executing hedge: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/coverage')
+def hedge_coverage():
+    """
+    Get real-time coverage ("cents on dollar") at various drawdown scenarios.
+
+    Query params:
+        - drawdowns: comma-separated list (e.g., "-0.05,-0.10,-0.20,-0.30")
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        # Get hedge status which includes coverage
+        status = hedge_engine.get_hedge_status()
+
+        if not status.get('success'):
+            return jsonify({'error': 'Failed to get hedge status'}), 500
+
+        return jsonify({
+            'success': True,
+            'coverage': status.get('current_coverage', {}),
+            'portfolio': status.get('portfolio', {}),
+            'num_positions': status.get('num_positions', 0)
+        })
+    except Exception as e:
+        logging.error(f"Error getting coverage: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hedge/positions')
+def hedge_positions():
+    """Get all active hedge positions from Kalshi"""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        status = hedge_engine.get_hedge_status()
+
+        if status.get('success'):
+            return jsonify({
+                'success': True,
+                'positions': status.get('active_positions', []),
+                'num_positions': status.get('num_positions', 0)
+            })
+        else:
+            return jsonify({'error': 'Failed to get positions'}), 500
+    except Exception as e:
+        logging.error(f"Error getting positions: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# PERPETUALS DELTA HEDGING ENDPOINTS
+# ============================================================================
+
+@app.route('/api/hedge/perp/positions')
+def hedge_perp_positions():
+    """Get current perpetual futures positions"""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        result = hedge_engine.get_perp_positions()
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error getting perp positions: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hedge/perp/order', methods=['POST'])
+def hedge_perp_order():
+    """
+    Place a perpetual futures order.
+
+    Request body:
+        {
+            "product_id": "BTC-PERP-INTX",
+            "side": "buy" or "sell",
+            "size": 0.1,
+            "order_type": "market", "limit", or "stop_limit",
+            "limit_price": 114000 (optional, for limit/stop_limit),
+            "stop_price": 113000 (optional, for stop_limit)
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        product_id = data.get('product_id', 'BTC-PERP-INTX')
+        side = data.get('side')
+        size = data.get('size')
+        order_type = data.get('order_type', 'market')
+        limit_price = data.get('limit_price')
+        stop_price = data.get('stop_price')
+
+        if not side or not size:
+            return jsonify({'error': 'side and size are required'}), 400
+
+        result = hedge_engine.place_perp_order(
+            product_id=product_id,
+            side=side,
+            size=size,
+            order_type=order_type,
+            limit_price=limit_price,
+            stop_price=stop_price
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error placing perp order: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/delta')
+def hedge_delta():
+    """Get total BTC delta exposure across all positions"""
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        result = hedge_engine.calculate_total_delta()
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error calculating delta: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/hedge/auto-delta', methods=['POST'])
+def hedge_auto_delta():
+    """
+    Automatically hedge delta to target percentage.
+
+    Request body:
+        {
+            "target_delta_pct": 0.90,  // Target 90% delta
+            "product_id": "BTC-PERP-INTX",
+            "dry_run": true
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        target_delta_pct = data.get('target_delta_pct', 0.90)
+        product_id = data.get('product_id', 'BTC-PERP-INTX')
+        dry_run = data.get('dry_run', True)
+
+        logging.info(f"Auto-hedging delta to {target_delta_pct*100:.0f}% (dry_run={dry_run})")
+
+        result = hedge_engine.auto_hedge_delta(
+            target_delta_pct=target_delta_pct,
+            product_id=product_id,
+            dry_run=dry_run
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error in auto-hedge: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/simulate-combined', methods=['POST'])
+def hedge_simulate_combined():
+    """
+    Simulate combined hedging strategy using both Perpetuals and Kalshi options.
+
+    Request body:
+        {
+            "perp_delta_target_pct": 0.90,  // Target 90% delta for perps
+            "kalshi_budget_pct": 0.02,      // 2% monthly budget for Kalshi
+            "kalshi_coverage_target": 0.68  // 68 cents on dollar coverage
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        perp_delta_target_pct = data.get('perp_delta_target_pct', 0.90)
+        kalshi_budget_pct = data.get('kalshi_budget_pct', 0.02)
+        kalshi_coverage_target = data.get('kalshi_coverage_target', 0.68)
+
+        logging.info(f"Running combined hedge simulation: perp_delta={perp_delta_target_pct*100:.0f}%, kalshi_budget={kalshi_budget_pct*100:.1f}%")
+
+        result = hedge_engine.simulate_combined_hedge(
+            perp_delta_target_pct=perp_delta_target_pct,
+            kalshi_budget_pct=kalshi_budget_pct,
+            kalshi_coverage_target=kalshi_coverage_target
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error in combined simulation: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/daily-trading', methods=['POST'])
+def hedge_daily_trading():
+    """
+    Simulate combined hedging strategy using ONLY Kalshi markets expiring today.
+
+    Request body:
+        {
+            "kalshi_budget_pct": 0.02,      // Budget for Kalshi as % of notional (2%)
+            "perp_delta_target_pct": 0.90   // Target delta with perps (90% = 10% hedge)
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        kalshi_budget_pct = data.get('kalshi_budget_pct', 0.02)
+        perp_delta_target_pct = data.get('perp_delta_target_pct', 0.90)
+
+        logging.info(f"Running daily Kalshi combined hedge: kalshi_budget={kalshi_budget_pct*100}%, perp_target={perp_delta_target_pct*100}%")
+
+        result = hedge_engine.simulate_daily_kalshi_trading(
+            kalshi_budget_pct=kalshi_budget_pct,
+            perp_delta_target_pct=perp_delta_target_pct
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error in daily trading simulation: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/execute-daily', methods=['POST'])
+def execute_daily_hedge():
+    """
+    Execute the daily combined hedge strategy (Kalshi + Coinbase perpetuals).
+
+    Request body:
+        {
+            "simulation_result": {...},  // Result from /api/hedge/daily-trading
+            "dry_run": true,             // If true, simulate without placing real orders
+            "product_id": "BTC-PERP-INTX" // Perpetual product to trade (optional)
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+        simulation_result = data.get('simulation_result')
+        dry_run = data.get('dry_run', True)
+        product_id = data.get('product_id', 'BTC-PERP-INTX')
+
+        if not simulation_result:
+            return jsonify({'error': 'simulation_result required', 'success': False}), 400
+
+        logging.info(f"Executing daily hedge: dry_run={dry_run}, product_id={product_id}")
+
+        result = hedge_engine.execute_daily_hedge(
+            simulation_result=simulation_result,
+            dry_run=dry_run,
+            product_id=product_id
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error executing daily hedge: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@app.route('/api/hedge/live-positions', methods=['GET'])
+def get_live_hedge_positions():
+    """
+    Get all active hedge positions for live tracking.
+
+    Returns:
+        {
+            "success": bool,
+            "spot_position": {...},        // BTC spot holdings
+            "perp_positions": [...],       // Coinbase perpetual positions with P&L
+            "kalshi_positions": [...],     // Kalshi binary option positions with P&L
+            "combined_pnl": float,         // Total unrealized P&L
+            "current_delta": float,        // Current BTC delta exposure
+            "delta_pct": float,            // Delta as % of spot holdings
+            "timestamp": str
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        logging.info("Fetching live hedge positions")
+
+        result = hedge_engine.get_live_hedge_positions()
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error getting live hedge positions: {e}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+# ============================================================================
+# ENHANCED HEDGE OPTIMIZATION ENDPOINTS (GARCH + PROBABILITY WEIGHTING)
+# ============================================================================
+
+@app.route('/api/hedge/optimize-advanced', methods=['POST'])
+def hedge_optimize_advanced():
+    """
+    Enhanced hedge optimization using GARCH volatility, probability-weighted scenarios,
+    implied volatility analysis, and signal adjustments.
+
+    Request body:
+        {
+            "budget_pct": 0.02,              // Monthly budget as % of notional (default 2%)
+            "target_coverage": 0.68,          // Target cents on dollar (default 68%)
+            "min_coverage_drawdown": -0.20,   // Drawdown level for target (default -20%)
+            "horizon_days": 30,               // Time horizon for optimization (default 30)
+            "min_volume": 100,                // Minimum market volume filter
+            "prefer_underpriced": true,       // Prefer IV < GARCH vol contracts
+            "include_theta": true,            // Include time decay scoring
+            "include_transaction_costs": true, // Include slippage in costs
+            "slippage_pct": 0.015,            // Expected slippage (default 1.5%)
+            "signal_kwargs": {                // Optional signal adjustments
+                "funding_rate": 0.001,
+                "rsi": 72,
+                "vix": 18
+            }
+        }
+
+    Returns:
+        {
+            "success": bool,
+            "optimization": {...},            // LP optimization results
+            "volatility_analysis": {...},     // GARCH forecasts and analysis
+            "probability_scenarios": [...],   // Probability-weighted scenarios used
+            "market_analysis": {...},         // IV mispricing detection
+            "recommended_trades": [...],      // Filtered by EV threshold
+            "expected_coverage": {...}        // Coverage at various drawdown levels
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+
+        budget_pct = data.get('budget_pct', 0.02)
+        target_coverage = data.get('target_coverage', 0.68)
+        min_coverage_drawdown = data.get('min_coverage_drawdown', -0.20)
+        horizon_days = data.get('horizon_days', 30)
+        min_volume = data.get('min_volume', 100)
+        prefer_underpriced = data.get('prefer_underpriced', True)
+        include_theta = data.get('include_theta', True)
+        include_transaction_costs = data.get('include_transaction_costs', True)
+        slippage_pct = data.get('slippage_pct', 0.015)
+        signal_kwargs = data.get('signal_kwargs', None)
+
+        logging.info(f"Running advanced hedge optimization: budget={budget_pct*100:.1f}%, "
+                     f"horizon={horizon_days}d, target={target_coverage*100:.0f}%")
+
+        result = hedge_engine.optimize_hedge_advanced(
+            budget_pct=budget_pct,
+            target_coverage=target_coverage,
+            min_coverage_drawdown=min_coverage_drawdown,
+            horizon_days=horizon_days,
+            min_volume=min_volume,
+            prefer_underpriced=prefer_underpriced,
+            include_theta=include_theta,
+            include_transaction_costs=include_transaction_costs,
+            slippage_pct=slippage_pct,
+            signal_kwargs=signal_kwargs
+        )
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error in advanced hedge optimization: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/hedge/volatility', methods=['GET'])
+def hedge_volatility():
+    """
+    Get comprehensive volatility analysis including GARCH forecasts,
+    realized volatility, and market regime assessment.
+
+    Returns:
+        {
+            "success": bool,
+            "garch": {
+                "current_vol": float,         // Current annualized volatility
+                "forecast_30d": float,        // 30-day average forecast
+                "params": {...},              // GARCH parameters (omega, alpha, beta)
+                "persistence": float          // alpha + beta (should be < 1)
+            },
+            "realized": {
+                "vol_7d": float,              // 7-day realized vol
+                "vol_30d": float,             // 30-day realized vol
+                "vol_90d": float              // 90-day realized vol
+            },
+            "regime": {
+                "current": str,               // "low", "normal", "high", "extreme"
+                "interpretation": str         // Human-readable description
+            },
+            "drawdown_distribution": {...},   // Historical drawdown percentiles
+            "historical_var": {...}           // Value at Risk metrics
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        logging.info("Fetching volatility analysis")
+
+        result = hedge_engine.get_volatility_analysis()
+
+        return jsonify(result)
+    except Exception as e:
+        logging.error(f"Error getting volatility analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/hedge/probability', methods=['POST'])
+def hedge_probability():
+    """
+    Calculate model probability for a specific strike price using GARCH
+    and signal adjustments.
+
+    Request body:
+        {
+            "strike_price": 85000,            // Strike price to calculate probability for
+            "horizon_days": 30,               // Time horizon (default 30)
+            "signal_kwargs": {                // Optional signal adjustments
+                "funding_rate": 0.001,
+                "rsi": 72,
+                "vix": 18
+            }
+        }
+
+    Returns:
+        {
+            "success": bool,
+            "strike_price": float,
+            "current_price": float,
+            "drawdown_pct": float,            // Implied drawdown to strike
+            "base_probability": float,        // Lognormal probability before signals
+            "adjusted_probability": float,    // Final probability after signal adjustment
+            "signal_adjustment": float,       // Total signal adjustment applied
+            "garch_vol": float,               // GARCH volatility used
+            "horizon_days": int
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+
+        strike_price = data.get('strike_price')
+        if strike_price is None:
+            return jsonify({'error': 'strike_price is required'}), 400
+
+        horizon_days = data.get('horizon_days', 30)
+        signal_kwargs = data.get('signal_kwargs', {})
+
+        logging.info(f"Calculating probability for strike ${strike_price:,.0f}")
+
+        # Import required modules
+        from market_data_service import get_market_data_service
+        from volatility_model import GARCHVolatilityModel, SignalAdjuster
+        import numpy as np
+        from scipy.stats import norm
+
+        # Get market data
+        market_data = get_market_data_service()
+        df = market_data.fetch_ohlc_data(days=365)
+        current_price = float(df['close'].iloc[-1])
+
+        # Fit GARCH model
+        returns = market_data.calculate_log_returns()
+        garch_model = GARCHVolatilityModel()
+        garch_fit = garch_model.fit(returns)
+
+        # Get volatility forecast
+        forecast = garch_model.forecast_volatility(horizon=horizon_days)
+        avg_vol = float(forecast['volatility'].mean())
+
+        # Calculate base lognormal probability
+        drawdown_pct = (strike_price - current_price) / current_price
+        daily_vol = avg_vol / np.sqrt(365)
+        period_vol = daily_vol * np.sqrt(horizon_days)
+
+        z_score = np.log(strike_price / current_price) / period_vol
+        base_prob = float(norm.cdf(z_score))
+
+        # Apply signal adjustments
+        signal_adjuster = SignalAdjuster()
+        adjustment = signal_adjuster.compute_adjustment(**signal_kwargs)
+        adjusted_prob = signal_adjuster.adjust_probability(base_prob, **signal_kwargs)
+
+        return jsonify({
+            'success': True,
+            'strike_price': strike_price,
+            'current_price': current_price,
+            'drawdown_pct': drawdown_pct,
+            'base_probability': base_prob,
+            'adjusted_probability': adjusted_prob,
+            'signal_adjustment': adjustment,
+            'garch_vol': avg_vol,
+            'horizon_days': horizon_days
+        })
+    except Exception as e:
+        logging.error(f"Error calculating probability: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+@app.route('/api/hedge/expected-value', methods=['POST'])
+def hedge_expected_value():
+    """
+    Calculate expected value (edge) for Kalshi markets by comparing
+    model probability to market price.
+
+    Request body:
+        {
+            "min_edge_threshold": 0.04,       // Minimum EV to consider (default 4%)
+            "horizon_days": 30,               // Time horizon (default 30)
+            "min_volume": 100,                // Minimum market volume
+            "signal_kwargs": {}               // Optional signal adjustments
+        }
+
+    Returns:
+        {
+            "success": bool,
+            "opportunities": [
+                {
+                    "market_ticker": str,
+                    "strike_price": float,
+                    "market_price": float,    // Current YES price
+                    "model_probability": float,
+                    "expected_value": float,  // p_model - p_market
+                    "edge_pct": float,        // EV as percentage
+                    "recommendation": str     // "BUY", "AVOID", or "NEUTRAL"
+                }
+            ],
+            "summary": {
+                "total_markets_analyzed": int,
+                "opportunities_found": int,
+                "avg_edge": float
+            }
+        }
+    """
+    try:
+        if not hedge_engine:
+            return jsonify({'error': 'Hedge engine not initialized'}), 500
+
+        data = request.get_json() or {}
+
+        min_edge_threshold = data.get('min_edge_threshold', 0.04)
+        horizon_days = data.get('horizon_days', 30)
+        min_volume = data.get('min_volume', 100)
+        signal_kwargs = data.get('signal_kwargs', {})
+
+        logging.info(f"Analyzing expected value across markets (threshold={min_edge_threshold*100:.0f}%)")
+
+        # Import required modules
+        from market_data_service import get_market_data_service
+        from volatility_model import GARCHVolatilityModel, SignalAdjuster
+        import numpy as np
+        from scipy.stats import norm
+
+        # Get market data and fit GARCH
+        market_data = get_market_data_service()
+        df = market_data.fetch_ohlc_data(days=365)
+        current_price = float(df['close'].iloc[-1])
+
+        returns = market_data.calculate_log_returns()
+        garch_model = GARCHVolatilityModel()
+        garch_model.fit(returns)
+
+        forecast = garch_model.forecast_volatility(horizon=horizon_days)
+        avg_vol = float(forecast['volatility'].mean())
+        daily_vol = avg_vol / np.sqrt(365)
+        period_vol = daily_vol * np.sqrt(horizon_days)
+
+        signal_adjuster = SignalAdjuster()
+
+        # Fetch Kalshi markets
+        markets = hedge_engine.kalshi_engine.fetch_btc_binary_markets() if hedge_engine.kalshi_engine else []
+
+        opportunities = []
+        for market in markets:
+            if market.get('volume', 0) < min_volume:
+                continue
+
+            strike_price = market.get('strike_price', 0)
+            if strike_price <= 0 or strike_price >= current_price:
+                continue
+
+            # Get market price (YES price for "below strike")
+            yes_price = market.get('yes_price', market.get('last_price', 0))
+            if yes_price <= 0:
+                continue
+            market_prob = yes_price / 100.0  # Convert cents to probability
+
+            # Calculate model probability
+            z_score = np.log(strike_price / current_price) / period_vol
+            base_prob = float(norm.cdf(z_score))
+            model_prob = signal_adjuster.adjust_probability(base_prob, **signal_kwargs)
+
+            # Calculate expected value
+            ev = model_prob - market_prob
+
+            recommendation = "NEUTRAL"
+            if ev >= min_edge_threshold:
+                recommendation = "BUY"
+            elif ev <= -min_edge_threshold:
+                recommendation = "AVOID"
+
+            opportunities.append({
+                'market_ticker': market.get('ticker', 'unknown'),
+                'strike_price': strike_price,
+                'market_price': yes_price,
+                'model_probability': round(model_prob, 4),
+                'expected_value': round(ev, 4),
+                'edge_pct': round(ev * 100, 2),
+                'recommendation': recommendation
+            })
+
+        # Sort by absolute EV
+        opportunities.sort(key=lambda x: abs(x['expected_value']), reverse=True)
+
+        # Filter to only significant opportunities
+        significant_opps = [o for o in opportunities if abs(o['expected_value']) >= min_edge_threshold]
+
+        return jsonify({
+            'success': True,
+            'opportunities': opportunities,
+            'significant_opportunities': significant_opps,
+            'summary': {
+                'total_markets_analyzed': len(markets),
+                'opportunities_found': len(significant_opps),
+                'avg_edge': round(np.mean([o['expected_value'] for o in significant_opps]) if significant_opps else 0, 4),
+                'current_price': current_price,
+                'garch_vol': round(avg_vol, 4),
+                'horizon_days': horizon_days
+            }
+        })
+    except Exception as e:
+        logging.error(f"Error calculating expected value: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'success': False}), 500
+
 
 @socketio.on('connect')
 def handle_connect():

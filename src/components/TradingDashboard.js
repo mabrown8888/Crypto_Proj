@@ -33,20 +33,20 @@ ChartJS.register(
 
 const TradingDashboard = () => {
   const [botData, setBotData] = useState({
-    currentPrice: 104969.00,
-    signal: 'BUY',
-    reason: 'Buy signals: 1, Sell signals: 0',
-    portfolio: 500.00,
+    currentPrice: 0,
+    signal: 'HOLD',
+    reason: 'Initializing...',
+    portfolio: 0,
     dailyPnL: 0.00,
     totalPnL: 0.00,
     dailyTrades: 0,
     position: null,
     indicators: {
-      rsi: 45.2,
-      sma_short: 104800,
-      sma_long: 105200,
-      bollinger_upper: 106000,
-      bollinger_lower: 103800
+      rsi: 0,
+      sma_short: 0,
+      sma_long: 0,
+      bollinger_upper: 0,
+      bollinger_lower: 0
     }
   });
 
@@ -79,20 +79,20 @@ const TradingDashboard = () => {
       
       // Map backend data structure to frontend data structure
       const mappedData = {
-        currentPrice: data.current_price || data.currentPrice || 104969.00,
+        currentPrice: data.current_price || data.currentPrice || 0,
         signal: data.signal || 'HOLD',
         reason: data.reason || 'Initializing...',
-        portfolio: data.portfolio_value || data.portfolio || 500.00,
+        portfolio: data.portfolio_value || data.portfolio || 0,
         dailyPnL: data.daily_pnl || data.dailyPnL || 0.00,
         totalPnL: data.total_pnl || data.totalPnL || 0.00,
         dailyTrades: data.daily_trades || data.dailyTrades || 0,
         position: data.position || null,
         indicators: data.indicators || {
-          rsi: 45.2,
-          sma_short: 104800,
-          sma_long: 105200,
-          bollinger_upper: 106000,
-          bollinger_lower: 103800
+          rsi: 0,
+          sma_short: 0,
+          sma_long: 0,
+          bollinger_upper: 0,
+          bollinger_lower: 0
         }
       };
       
@@ -122,20 +122,20 @@ const TradingDashboard = () => {
           console.log('Fetched data via API:', data);
           
           const mappedData = {
-            currentPrice: data.current_price || 104969.00,
+            currentPrice: data.current_price || 0,
             signal: data.signal || 'HOLD',
             reason: data.reason || 'Initializing...',
-            portfolio: data.portfolio_value || 500.00,
+            portfolio: data.portfolio_value || 0,
             dailyPnL: data.daily_pnl || 0.00,
             totalPnL: data.total_pnl || 0.00,
             dailyTrades: data.daily_trades || 0,
             position: data.position || null,
             indicators: data.indicators || {
-              rsi: 45.2,
-              sma_short: 104800,
-              sma_long: 105200,
-              bollinger_upper: 106000,
-              bollinger_lower: 103800
+              rsi: 0,
+              sma_short: 0,
+              sma_long: 0,
+              bollinger_upper: 0,
+              bollinger_lower: 0
             }
           };
           

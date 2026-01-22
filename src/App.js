@@ -1,37 +1,36 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Activity, 
-  TrendingUp, 
-  TrendingDown, 
-  Bot, 
-  Mic, 
+import {
+  Activity,
+  TrendingUp,
+  TrendingDown,
+  Bot,
+  Mic,
   MicOff,
   Bell,
-  Brain,
   DollarSign,
   BarChart3,
   Settings,
   History,
   LogOut
 } from 'lucide-react';
-import TradingDashboard from './components/TradingDashboard';
-import SentimentAnalysis from './components/SentimentAnalysis';
-import WhaleTracker from './components/WhaleTracker';
-import AIStrategies from './components/AIStrategies';
+import Portfolio from './components/Portfolio';
+import Trade from './components/Trade';
 import VoiceCommands from './components/VoiceCommands';
 import BotStatus from './components/BotStatus';
 import TradingHistory from './components/TradingHistory';
-import CryptoDashboard from './components/CryptoDashboard';
 import NotificationsModal from './components/NotificationsModal';
 import SettingsModal from './components/SettingsModal';
 import LoginForm from './components/LoginForm';
-
-import SportsBetting from './components/SportsBetting';
+import EnhancedAutoTradingBot from './components/EnhancedAutoTradingBot';
+import KalshiDashboard from './components/KalshiDashboard';
+import HedgeDashboard from './components/HedgeDashboard';
+import BTCMonitor from './components/BTCMonitor';
+import AlgorithmAnalytics from './components/AlgorithmAnalytics';
 import { authUtils, setupTokenRefresh } from './utils/auth';
 
 function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
-  const [botConnected, setBotConnected] = useState(false);
+  const [activeTab, setActiveTab] = useState('portfolio');
+  const [botConnected] = useState(false);
   const [voiceActive, setVoiceActive] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -67,33 +66,36 @@ function App() {
   }
 
   const tabs = [
-    { id: 'dashboard', name: 'Dashboard', icon: BarChart3 },
-    { id: 'crypto', name: 'Multi-Crypto', icon: DollarSign },
+    { id: 'portfolio', name: 'Portfolio', icon: DollarSign },
+    { id: 'trade', name: 'Trade', icon: BarChart3 },
+    { id: 'auto-trading', name: 'Coinbase Trading Bot', icon: Bot },
     { id: 'history', name: 'Trading History', icon: History },
-    { id: 'sentiment', name: 'Sentiment', icon: Brain },
-    { id: 'whales', name: 'Whale Tracker', icon: TrendingUp },
-    { id: 'ai-strategies', name: 'AI Strategies', icon: Bot },
-    { id: 'sports-betting', name: 'Sports Betting', icon: Activity },
+    { id: 'kalshi', name: 'Kalshi Markets', icon: TrendingUp },
+    { id: 'btc-monitor', name: 'BTC Monitor', icon: Activity },
+    { id: 'hedge', name: 'Kalshi Trading Bot', icon: TrendingDown },
+    { id: 'analytics', name: 'Algorithm Analytics', icon: Activity },
   ];
 
   const renderActiveComponent = () => {
     switch (activeTab) {
-      case 'dashboard':
-        return <TradingDashboard />;
-      case 'crypto':
-        return <CryptoDashboard />;
+      case 'portfolio':
+        return <Portfolio />;
+      case 'trade':
+        return <Trade />;
+      case 'auto-trading':
+        return <EnhancedAutoTradingBot />;
       case 'history':
         return <TradingHistory />;
-      case 'sentiment':
-        return <SentimentAnalysis />;
-      case 'whales':
-        return <WhaleTracker />;
-      case 'ai-strategies':
-        return <AIStrategies />;
-      case 'sports-betting':
-        return <SportsBetting />;
+      case 'kalshi':
+        return <KalshiDashboard />;
+      case 'btc-monitor':
+        return <BTCMonitor />;
+      case 'hedge':
+        return <HedgeDashboard />;
+      case 'analytics':
+        return <AlgorithmAnalytics />;
       default:
-        return <TradingDashboard />;
+        return <Portfolio />;
     }
   };
 

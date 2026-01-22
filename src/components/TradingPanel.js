@@ -12,12 +12,12 @@ import {
 } from 'lucide-react';
 import { authUtils } from '../utils/auth';
 
-const TradingPanel = () => {
+const TradingPanel = ({ selectedPair = 'BTC-USDC', currentPrice = 0 }) => {
   const [balances, setBalances] = useState([]);
   const [quote, setQuote] = useState(null);
   const [tradeForm, setTradeForm] = useState({
     action: 'buy',
-    symbol: 'BTC-USDC',
+    symbol: selectedPair,
     amountType: 'usd',
     amount: 25
   });
@@ -29,6 +29,10 @@ const TradingPanel = () => {
   useEffect(() => {
     fetchBalances();
   }, []);
+
+  useEffect(() => {
+    setTradeForm(prev => ({ ...prev, symbol: selectedPair }));
+  }, [selectedPair]);
 
   useEffect(() => {
     if (tradeForm.amount > 0) {
@@ -54,17 +58,57 @@ const TradingPanel = () => {
     try {
       const response = await authUtils.authenticatedFetch('http://localhost:5001/api/get-quote', {
         method: 'POST',
-        body: JSON.stringify(tradeForm),
+        body: JSON.stringify({
+          ...tradeForm,
+          current_price: currentPrice // Pass current price to backend
+        }),
       });
-      
+
       if (response.ok) {
         const data = await response.json();
         setQuote(data);
       } else if (response.status === 401) {
         authUtils.logout();
+      } else {
+        // If quote fails, create a manual quote estimate using currentPrice
+        if (currentPrice > 0) {
+          const cryptoAmount = tradeForm.amountType === 'usd'
+            ? tradeForm.amount / currentPrice
+            : tradeForm.amount;
+          const usdAmount = tradeForm.amountType === 'crypto'
+            ? tradeForm.amount * currentPrice
+            : tradeForm.amount;
+          const estimatedFee = usdAmount * 0.006; // 0.6% fee estimate
+
+          setQuote({
+            current_price: currentPrice,
+            crypto_amount: cryptoAmount,
+            usd_amount: usdAmount,
+            estimated_fee: estimatedFee,
+            total_cost: usdAmount + estimatedFee
+          });
+        }
       }
     } catch (error) {
       console.error('Error fetching quote:', error);
+      // Fallback to manual quote
+      if (currentPrice > 0) {
+        const cryptoAmount = tradeForm.amountType === 'usd'
+          ? tradeForm.amount / currentPrice
+          : tradeForm.amount;
+        const usdAmount = tradeForm.amountType === 'crypto'
+          ? tradeForm.amount * currentPrice
+          : tradeForm.amount;
+        const estimatedFee = usdAmount * 0.006;
+
+        setQuote({
+          current_price: currentPrice,
+          crypto_amount: cryptoAmount,
+          usd_amount: usdAmount,
+          estimated_fee: estimatedFee,
+          total_cost: usdAmount + estimatedFee
+        });
+      }
     }
   };
 
@@ -111,12 +155,14 @@ const TradingPanel = () => {
   };
 
   const validateTrade = () => {
+    const cryptoSymbol = selectedPair.split('-')[0];
+
     if (tradeForm.action === 'buy') {
       const usdBalance = getAvailableBalance('USDC') + getAvailableBalance('USD');
       const requiredAmount = quote ? quote.total_cost : tradeForm.amount;
       return usdBalance >= requiredAmount;
     } else {
-      const cryptoBalance = getAvailableBalance('BTC');
+      const cryptoBalance = getAvailableBalance(cryptoSymbol);
       const requiredAmount = quote ? quote.crypto_amount : tradeForm.amount;
       return cryptoBalance >= requiredAmount;
     }
@@ -124,64 +170,68 @@ const TradingPanel = () => {
 
   const BalanceCard = ({ currency, available, total, held }) => (
     <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-3">
         <span className="font-medium text-crypto-blue">{currency}</span>
         <Wallet className="h-4 w-4 text-gray-400" />
       </div>
-      <div className="space-y-1">
-        <div className="flex justify-between text-sm">
-          <span className="text-gray-400">Available:</span>
-          <span className="font-medium">
+      <div className="space-y-2">
+        <div>
+          <div className="text-xs text-gray-400 mb-1">Available:</div>
+          <div className="font-medium text-lg truncate">
             {currency === 'BTC' ? available.toFixed(8) : available.toFixed(2)}
-          </span>
+          </div>
         </div>
         {held > 0 && (
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400">Held:</span>
-            <span className="text-orange-400">
+          <div>
+            <div className="text-xs text-gray-400 mb-1">Held:</div>
+            <div className="text-orange-400 font-medium truncate">
               {currency === 'BTC' ? held.toFixed(8) : held.toFixed(2)}
-            </span>
+            </div>
           </div>
         )}
       </div>
     </div>
   );
 
-  const QuoteDisplay = ({ quote }) => (
-    <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
-      <h4 className="font-medium mb-3 text-crypto-blue">Trade Preview</h4>
-      <div className="space-y-2 text-sm">
-        <div className="flex justify-between">
-          <span className="text-gray-400">Current Price:</span>
-          <span className="font-medium">${quote.current_price.toLocaleString()}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-gray-400">
-            {tradeForm.action === 'buy' ? 'You pay:' : 'You receive:'}
-          </span>
-          <span className="font-medium">${quote.usd_amount.toFixed(2)}</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-gray-400">
-            {tradeForm.action === 'buy' ? 'You receive:' : 'You pay:'}
-          </span>
-          <span className="font-medium">{quote.crypto_amount.toFixed(8)} BTC</span>
-        </div>
-        <div className="flex justify-between">
-          <span className="text-gray-400">Estimated Fee:</span>
-          <span className="text-orange-400">${quote.estimated_fee.toFixed(2)}</span>
-        </div>
-        <div className="border-t border-gray-600 pt-2 mt-2">
-          <div className="flex justify-between font-medium">
-            <span>Total {tradeForm.action === 'buy' ? 'Cost:' : 'Received:'}</span>
-            <span className={tradeForm.action === 'buy' ? 'text-red-400' : 'text-green-400'}>
-              ${quote.total_cost.toFixed(2)}
+  const QuoteDisplay = ({ quote }) => {
+    const cryptoSymbol = tradeForm.symbol.split('-')[0];
+
+    return (
+      <div className="bg-gray-700 rounded-lg p-4 border border-gray-600">
+        <h4 className="font-medium mb-3 text-crypto-blue">Trade Preview</h4>
+        <div className="space-y-2.5 text-sm">
+          <div className="flex justify-between items-start gap-2">
+            <span className="text-gray-400 flex-shrink-0">Current Price:</span>
+            <span className="font-medium text-right break-all">${quote.current_price.toLocaleString()}</span>
+          </div>
+          <div className="flex justify-between items-start gap-2">
+            <span className="text-gray-400 flex-shrink-0">
+              {tradeForm.action === 'buy' ? 'You pay:' : 'You receive:'}
             </span>
+            <span className="font-medium text-right">${quote.usd_amount.toFixed(2)}</span>
+          </div>
+          <div className="flex justify-between items-start gap-2">
+            <span className="text-gray-400 flex-shrink-0">
+              {tradeForm.action === 'buy' ? 'You receive:' : 'You pay:'}
+            </span>
+            <span className="font-medium text-right break-all">{quote.crypto_amount.toFixed(8)} {cryptoSymbol}</span>
+          </div>
+          <div className="flex justify-between items-start gap-2">
+            <span className="text-gray-400 flex-shrink-0">Estimated Fee:</span>
+            <span className="text-orange-400 text-right">${quote.estimated_fee.toFixed(2)}</span>
+          </div>
+          <div className="border-t border-gray-600 pt-2 mt-2">
+            <div className="flex justify-between items-start gap-2 font-medium">
+              <span className="flex-shrink-0">Total {tradeForm.action === 'buy' ? 'Cost:' : 'Received:'}</span>
+              <span className={`text-right ${tradeForm.action === 'buy' ? 'text-red-400' : 'text-green-400'}`}>
+                ${quote.total_cost.toFixed(2)}
+              </span>
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   if (tradeResult) {
     return (
@@ -221,6 +271,27 @@ const TradingPanel = () => {
     );
   }
 
+  const getRelevantBalances = () => {
+    const cryptoSymbol = selectedPair.split('-')[0];
+    const usdBalances = balances.filter(b => b.currency === 'USD' || b.currency === 'USDC');
+    const cryptoBalance = balances.find(b => b.currency === cryptoSymbol);
+
+    const result = [...usdBalances];
+    if (cryptoBalance) {
+      result.unshift(cryptoBalance);
+    } else {
+      // Show placeholder if crypto balance doesn't exist
+      result.unshift({
+        currency: cryptoSymbol,
+        available: 0,
+        total: 0,
+        held: 0
+      });
+    }
+
+    return result;
+  };
+
   return (
     <div className="space-y-6">
       {/* Account Balances */}
@@ -229,9 +300,9 @@ const TradingPanel = () => {
           <Wallet className="h-5 w-5 text-crypto-blue" />
           <span>Account Balances</span>
         </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {balances.length > 0 ? (
-            balances.map((balance, index) => (
+            getRelevantBalances().map((balance, index) => (
               <BalanceCard key={index} {...balance} />
             ))
           ) : (
@@ -282,14 +353,9 @@ const TradingPanel = () => {
               <label className="block text-sm font-medium text-gray-400 mb-2">
                 Trading Pair
               </label>
-              <select
-                value={tradeForm.symbol}
-                onChange={(e) => handleInputChange('symbol', e.target.value)}
-                className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white focus:ring-2 focus:ring-crypto-blue focus:border-transparent"
-              >
-                <option value="BTC-USDC">BTC/USDC</option>
-                {/* Add more pairs later */}
-              </select>
+              <div className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white">
+                {tradeForm.symbol.replace('-', '/')}
+              </div>
             </div>
 
             {/* Amount Type */}
@@ -316,7 +382,7 @@ const TradingPanel = () => {
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
                   }`}
                 >
-                  BTC Amount
+                  {tradeForm.symbol.split('-')[0]} Amount
                 </button>
               </div>
             </div>
@@ -324,7 +390,7 @@ const TradingPanel = () => {
             {/* Amount Input */}
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-2">
-                Amount {tradeForm.amountType === 'usd' ? '(USD)' : '(BTC)'}
+                Amount {tradeForm.amountType === 'usd' ? '(USD)' : `(${tradeForm.symbol.split('-')[0]})`}
               </label>
               <input
                 type="number"
@@ -384,7 +450,7 @@ const TradingPanel = () => {
               ) : (
                 <DollarSign className="h-4 w-4 inline mr-2" />
               )}
-              {tradeForm.action === 'buy' ? 'Buy' : 'Sell'} Bitcoin
+              {tradeForm.action === 'buy' ? 'Buy' : 'Sell'} {tradeForm.symbol.split('-')[0]}
             </button>
           </div>
         </div>
@@ -420,11 +486,11 @@ const TradingPanel = () => {
               </div>
               <div className="flex justify-between">
                 <span>Amount:</span>
-                <span>{quote.crypto_amount.toFixed(8)} BTC</span>
+                <span>{quote.crypto_amount.toFixed(8)} {tradeForm.symbol.split('-')[0]}</span>
               </div>
               <div className="flex justify-between">
                 <span>Price:</span>
-                <span>${quote.current_price.toLocaleString()}</span>
+                <span>${(quote.current_price || 0).toLocaleString()}</span>
               </div>
               <div className="flex justify-between">
                 <span>Total Cost:</span>

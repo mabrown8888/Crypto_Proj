@@ -12,6 +12,7 @@ import {
   AlertCircle,
   BarChart3
 } from 'lucide-react';
+import { authUtils } from '../utils/auth';
 
 const TradingHistory = () => {
   const [orders, setOrders] = useState([]);
@@ -38,10 +39,10 @@ const TradingHistory = () => {
   const fetchTradingHistory = async () => {
     setLoading(true);
     try {
-      // Fetch both orders and trades
+      // Fetch both orders and trades using authenticated fetch
       const [ordersResponse, tradesResponse] = await Promise.all([
-        fetch('http://localhost:5001/api/orders?limit=100'),
-        fetch('http://localhost:5001/api/trades?limit=100')
+        authUtils.authenticatedFetch('http://localhost:5001/api/orders?limit=100'),
+        authUtils.authenticatedFetch('http://localhost:5001/api/trades?limit=100')
       ]);
 
       if (ordersResponse.ok) {

@@ -67,6 +67,17 @@ MAX_HOURS_TO_EXPIRY = 720.0      # Extended to 30 days - capture more markets
 
 MUTUAL_EXCLUSIVITY = True        # Only bet on one range per expiry time
 
+# =============================================================================
+# DIVERSIFICATION & KELLY SIZING (NEW)
+# =============================================================================
+MAX_POSITIONS_PER_EXPIRY = 3     # Max 3 positions per expiry time (diversification limit)
+MAX_TOTAL_POSITIONS = 5          # Max 5 total positions per execution
+
+# Kelly Criterion settings
+KELLY_FRACTION = 0.25            # Use 1/4 Kelly (safer than full Kelly)
+MIN_KELLY_BET = 0.02             # Minimum 2% of budget per position
+MAX_KELLY_BET = 0.30             # Maximum 30% of budget per position
+
 # NEW: Probability estimation uncertainty (for risk-adjusted EV)
 # σ_prob estimates our model uncertainty
 BASE_PROB_UNCERTAINTY = 0.05     # Base uncertainty in probability estimate
@@ -75,6 +86,79 @@ VOL_UNCERTAINTY_SCALE = 0.02     # Additional uncertainty per 10% vol
 # ML Model paths
 ML_MODEL_PATH = Path(__file__).parent / 'models' / 'kalshi_btc_model.pkl'
 ML_DATA_PATH = Path(__file__).parent / 'data' / 'kalshi_historical.csv'
+
+
+# =============================================================================
+# KELLY CRITERION CALCULATION
+# =============================================================================
+def calculate_kelly_fraction(model_prob: float, price_cents: int) -> float:
+    """
+    Calculate Kelly fraction for a binary option.
+
+    For binary options:
+    - Cost = price_cents / 100
+    - Win payout = $1 (100 cents)
+    - Profit if win = (100 - price_cents) / 100
+    - b (odds) = profit / cost = (100 - price) / price
+
+    Kelly formula: f* = (p * b - q) / b
+    Where p = model_prob, q = 1 - p, b = (100 - price) / price
+
+    Simplified: f* = (model_prob * 100 - price) / (100 - price)
+
+    Args:
+        model_prob: Model's probability estimate (0-1)
+        price_cents: Price in cents (1-99)
+
+    Returns:
+        Kelly fraction (0-1), scaled by KELLY_FRACTION for safety
+    """
+    if price_cents <= 0 or price_cents >= 100:
+        return 0.0
+
+    # Edge = model_prob - market_prob (where market_prob = price/100)
+    edge = model_prob - (price_cents / 100.0)
+
+    if edge <= 0:
+        return 0.0  # No edge, don't bet
+
+    # Kelly: f* = edge / (1 - market_prob) = edge / potential_profit_per_dollar
+    # For binary: potential profit = (100 - price) / price per dollar risked
+    # Simplified: f* = (model_prob * 100 - price) / (100 - price)
+    kelly_full = (model_prob * 100 - price_cents) / (100 - price_cents)
+
+    # Apply fractional Kelly for safety
+    kelly_fraction = kelly_full * KELLY_FRACTION
+
+    # Clamp to bounds
+    kelly_fraction = max(MIN_KELLY_BET, min(MAX_KELLY_BET, kelly_fraction))
+
+    return kelly_fraction
+
+
+def calculate_kelly_contracts(model_prob: float, price_cents: int, budget: float) -> int:
+    """
+    Calculate number of contracts to buy using Kelly criterion.
+
+    Args:
+        model_prob: Model's probability estimate (0-1)
+        price_cents: Price in cents (1-99)
+        budget: Available budget in dollars
+
+    Returns:
+        Number of contracts to buy
+    """
+    kelly_frac = calculate_kelly_fraction(model_prob, price_cents)
+
+    # How much to risk
+    risk_amount = budget * kelly_frac
+
+    # Convert to contracts
+    cost_per_contract = price_cents / 100.0
+    contracts = int(risk_amount / cost_per_contract)
+
+    # Minimum 1 contract if we have positive Kelly
+    return max(1, contracts) if kelly_frac > 0 else 0
 
 
 # =============================================================================

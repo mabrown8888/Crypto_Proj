@@ -3743,16 +3743,42 @@ def execute_kalshi_trades():
                 'timestamp': datetime.now().isoformat()
             })
 
-        # Execute trades
+        # Execute trades with Kelly sizing and diversification limits
+        from kalshi_ml_trader import (
+            calculate_kelly_contracts,
+            MAX_POSITIONS_PER_EXPIRY,
+            MAX_TOTAL_POSITIONS
+        )
+
         results = []
         total_cost = 0
+        positions_by_expiry = {}  # Track positions per expiry for diversification
+        total_positions = 0
 
         for trade in trades:
+            # Check budget limit
             if total_cost >= effective_budget:
+                logging.info(f"Budget exhausted: ${total_cost:.2f} >= ${effective_budget:.2f}")
+                break
+
+            # Check total position limit
+            if total_positions >= MAX_TOTAL_POSITIONS:
+                logging.info(f"Max total positions reached: {total_positions} >= {MAX_TOTAL_POSITIONS}")
                 break
 
             ticker = trade.get('ticker')
             side = trade.get('side', 'YES').lower()
+
+            # Extract expiry from ticker for diversification tracking
+            # Ticker format: KXBTCD-26FEB0217-T77249.99 -> expiry = "26FEB0217"
+            ticker_parts = ticker.split('-') if ticker else []
+            expiry_key = ticker_parts[1] if len(ticker_parts) >= 2 else 'unknown'
+
+            # Check diversification limit per expiry
+            positions_at_expiry = positions_by_expiry.get(expiry_key, 0)
+            if positions_at_expiry >= MAX_POSITIONS_PER_EXPIRY:
+                logging.info(f"Skipping {ticker}: already have {positions_at_expiry} positions at expiry {expiry_key}")
+                continue
 
             # Calculate quantity based on remaining budget
             remaining_budget = effective_budget - total_cost
@@ -3777,11 +3803,24 @@ def execute_kalshi_trades():
                 })
                 continue
 
-            quantity = min(10, int(remaining_budget / (price_cents / 100)))  # Max 10 contracts per trade
+            # Get model probability for Kelly sizing
+            model_prob = trade.get('model_odds', 0) / 100.0 if trade.get('model_odds') else trade.get('model_prob', 0.5)
+
+            # Use Kelly criterion for position sizing
+            kelly_quantity = calculate_kelly_contracts(model_prob, int(price_cents), remaining_budget)
+
+            # Cap at max 20 contracts per trade (safety limit)
+            quantity = min(20, kelly_quantity)
+
             if quantity <= 0:
+                logging.info(f"Skipping {ticker}: Kelly suggests 0 contracts (model_prob={model_prob:.2%}, price={price_cents}c)")
                 continue
 
             cost = quantity * (price_cents / 100)
+            kelly_info = f"Kelly: model={model_prob:.1%}, price={price_cents}c -> {quantity} contracts"
+            logging.info(f"Position sizing for {ticker}: {kelly_info}")
+
+            trade_success = False
 
             if dry_run:
                 results.append({
@@ -3791,8 +3830,10 @@ def execute_kalshi_trades():
                     'price_cents': price_cents,
                     'cost': cost,
                     'status': 'simulated',
-                    'ev': trade.get('ev', 0)
+                    'ev': trade.get('ev', 0),
+                    'kelly_info': kelly_info
                 })
+                trade_success = True
             else:
                 # Execute real trade
                 try:
@@ -3813,8 +3854,10 @@ def execute_kalshi_trades():
                             'cost': cost,
                             'status': 'executed',
                             'order_id': order_result.get('order', {}).get('order_id'),
-                            'ev': trade.get('ev', 0)
+                            'ev': trade.get('ev', 0),
+                            'kelly_info': kelly_info
                         })
+                        trade_success = True
                     else:
                         results.append({
                             'ticker': ticker,
@@ -3835,7 +3878,12 @@ def execute_kalshi_trades():
                         'error': str(e)
                     })
 
-            total_cost += cost
+            # Track successful trades for diversification and budget
+            if trade_success:
+                total_cost += cost
+                total_positions += 1
+                positions_by_expiry[expiry_key] = positions_by_expiry.get(expiry_key, 0) + 1
+                logging.info(f"Trade recorded: {ticker} - total_positions={total_positions}, expiry {expiry_key} has {positions_by_expiry[expiry_key]} positions")
 
         return jsonify({
             'success': True,
@@ -3843,7 +3891,15 @@ def execute_kalshi_trades():
             'trades_executed': len([r for r in results if r['status'] in ['executed', 'simulated']]),
             'total_cost': total_cost,
             'results': results,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            # New: Diversification and sizing info
+            'diversification': {
+                'max_positions_per_expiry': MAX_POSITIONS_PER_EXPIRY,
+                'max_total_positions': MAX_TOTAL_POSITIONS,
+                'positions_by_expiry': positions_by_expiry,
+                'total_positions': total_positions
+            },
+            'sizing_method': 'kelly_criterion'
         })
 
     except Exception as e:

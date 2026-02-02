@@ -3784,10 +3784,14 @@ def execute_kalshi_trades():
             remaining_budget = effective_budget - total_cost
 
             # Get price - try multiple field names for compatibility
+            # Note: market_odds is the probability for the TRADED SIDE (already converted for NO trades)
+            # So for YES: market_odds = YES prob, price = market_odds cents
+            # For NO: market_odds = NO prob, price = market_odds cents (NOT 100 - market_odds!)
             if side == 'yes':
                 price_cents = trade.get('yes_ask') or trade.get('price') or trade.get('market_odds')
             else:
-                price_cents = trade.get('no_ask') or trade.get('price') or (100 - trade.get('market_odds', 0))
+                # For NO: no_ask is the NO price, market_odds is already NO probability
+                price_cents = trade.get('no_ask') or trade.get('price') or trade.get('market_odds')
 
             logging.info(f"Trade data: ticker={ticker}, side={side}, price_cents={price_cents}, trade_data={trade}")
 

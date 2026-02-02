@@ -3714,19 +3714,48 @@ def execute_kalshi_trades():
         if not trades:
             return jsonify({'success': False, 'error': 'No trades provided'}), 400
 
+        # ---------------------------------------------------------------
+        # BUDGET SAFETY: Subtract existing position cost from max_risk
+        # This prevents double-buying when clicking Execute multiple times
+        # ---------------------------------------------------------------
+        existing_cost = 0
+        try:
+            existing_positions = trader.kalshi.get_positions()
+            for pos in existing_positions:
+                total_cost_dollars = pos.get('total_cost', 0)
+                existing_cost += total_cost_dollars
+            logging.info(f"Existing Kalshi positions cost: ${existing_cost:.2f}")
+        except Exception as e:
+            logging.warning(f"Could not fetch existing positions for budget check: {e}")
+
+        effective_budget = max(0, max_risk - existing_cost)
+        logging.info(f"Budget: max_risk=${max_risk:.2f} - existing=${existing_cost:.2f} = effective=${effective_budget:.2f}")
+
+        if effective_budget <= 0:
+            return jsonify({
+                'success': True,
+                'dry_run': dry_run,
+                'trades_executed': 0,
+                'total_cost': 0,
+                'results': [],
+                'message': f'Budget exhausted: already have ${existing_cost:.2f} in positions (max_risk=${max_risk:.2f})',
+                'existing_cost': existing_cost,
+                'timestamp': datetime.now().isoformat()
+            })
+
         # Execute trades
         results = []
         total_cost = 0
 
         for trade in trades:
-            if total_cost >= max_risk:
+            if total_cost >= effective_budget:
                 break
 
             ticker = trade.get('ticker')
             side = trade.get('side', 'YES').lower()
 
             # Calculate quantity based on remaining budget
-            remaining_budget = max_risk - total_cost
+            remaining_budget = effective_budget - total_cost
 
             # Get price - try multiple field names for compatibility
             if side == 'yes':

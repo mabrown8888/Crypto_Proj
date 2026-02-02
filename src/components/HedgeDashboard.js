@@ -382,6 +382,7 @@ const HedgeDashboard = () => {
                         <th className="text-right pb-2 px-3">Current</th>
                         <th className="text-right pb-2 px-3">P&L</th>
                         <th className="text-center pb-2 px-3">Zone</th>
+                        <th className="text-left pb-2 px-3">Needs to Happen</th>
                         <th className="text-right pb-2 px-3">Expiry</th>
                         <th className="text-left pb-2 pl-4">Signal</th>
                       </tr>
@@ -430,6 +431,11 @@ const HedgeDashboard = () => {
                             <td className="text-center py-2 px-3">
                               <span className={`px-2 py-0.5 rounded text-xs font-medium ${zoneColors[pos.price_zone] || zoneColors['unknown']}`}>
                                 {pos.price_zone === 'DEEP_ITM' ? 'ITM' : pos.price_zone}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3">
+                              <span className="text-xs text-blue-300" title={pos.what_needs_to_happen}>
+                                {pos.what_needs_to_happen || '—'}
                               </span>
                             </td>
                             <td className="text-right py-2 px-3">

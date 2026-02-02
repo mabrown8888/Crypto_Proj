@@ -541,12 +541,15 @@ class KalshiEngine:
                 # Extract strike: B96250 or T95999.99
                 strike_part = ticker_parts[2]
 
-                # Parse side (B=Below/Yes, T=Top/Above/No)
+                # Parse side from position sign (applies to both B and T contracts)
+                # Positive position = YES contracts owned
+                # Negative position = NO contracts owned
+                # B=Below contract type, T=Top/Above contract type (doesn't affect side detection)
                 if strike_part.startswith('B'):
                     side = 'YES' if position_value > 0 else 'NO'
                     strike_str = strike_part[1:]
                 elif strike_part.startswith('T'):
-                    side = 'NO' if position_value > 0 else 'YES'
+                    side = 'YES' if position_value > 0 else 'NO'  # Same logic as B - position sign determines side
                     strike_str = strike_part[1:]
                 else:
                     strike_str = strike_part

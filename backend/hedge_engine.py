@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # SMART CASH-OUT CONFIGURATION
 # =============================================================================
+# MODE: MINIMAL INTERVENTION
+# - Only exit on stop-loss or near-expiry protection
+# - Let positions ride to settlement (binary options should settle, not be traded)
+# =============================================================================
 CASH_OUT_CONFIG = {
     # -------------------------------------------------------------------------
     # PRICE-ZONE THRESHOLDS (determines which rules apply)
@@ -38,31 +42,30 @@ CASH_OUT_CONFIG = {
     # Between 30-70¢ = at the money (normal rules)
 
     # -------------------------------------------------------------------------
-    # OUT OF THE MONEY (price < 30¢) - aggressive profit taking
+    # OUT OF THE MONEY (price < 30¢) - DISABLED (let it ride)
     # -------------------------------------------------------------------------
-    'otm_tier1_profit_pct': 0.20,  # +20% profit -> sell 50%
+    'otm_tier1_profit_pct': 9.99,  # DISABLED - was 0.20
     'otm_tier1_sell_pct': 0.50,
-    'otm_tier2_profit_pct': 0.40,  # +40% profit -> sell 30% more
+    'otm_tier2_profit_pct': 9.99,  # DISABLED - was 0.40
     'otm_tier2_sell_pct': 0.30,
-    'otm_tier3_profit_pct': 0.60,  # +60% profit -> sell remaining
+    'otm_tier3_profit_pct': 9.99,  # DISABLED - was 0.60
     'otm_tier3_sell_pct': 1.00,
 
     # -------------------------------------------------------------------------
-    # AT THE MONEY (30-70¢) - normal profit taking
+    # AT THE MONEY (30-70¢) - DISABLED (let it ride)
     # -------------------------------------------------------------------------
-    'atm_tier1_profit_pct': 0.25,  # +25% profit -> sell 50%
+    'atm_tier1_profit_pct': 9.99,  # DISABLED - was 0.25
     'atm_tier1_sell_pct': 0.50,
-    'atm_tier2_profit_pct': 0.50,  # +50% profit -> sell 30% more
+    'atm_tier2_profit_pct': 9.99,  # DISABLED - was 0.50
     'atm_tier2_sell_pct': 0.30,
-    'atm_tier3_profit_pct': 0.75,  # +75% profit -> sell remaining
+    'atm_tier3_profit_pct': 9.99,  # DISABLED - was 0.75
     'atm_tier3_sell_pct': 1.00,
 
     # -------------------------------------------------------------------------
     # DEEP IN THE MONEY (price > 70¢) - let it ride to $1
     # -------------------------------------------------------------------------
     # NO profit-based exits! Expected payout is ~$1
-    # Only exit on: stop loss, spread collapse, or extreme theta
-    'ditm_min_profit_to_sell': 0.90,  # Only sell if +90% (i.e., basically at $1)
+    'ditm_min_profit_to_sell': 9.99,  # DISABLED - let it settle at $1
 
     # -------------------------------------------------------------------------
     # TIME-BASED RULES
@@ -71,16 +74,17 @@ CASH_OUT_CONFIG = {
     'theta_warning_hours': 6,      # < 6 hours = theta accelerating
     'theta_exit_hours': 72,        # < 72 hours = consider theta (for longer dated)
 
-    # Near-expiry behavior:
+    # Near-expiry behavior (STILL ACTIVE - protects against theta death):
     'near_expiry_itm_hold': 60,    # If < 1hr left AND price > 60¢ → HOLD for $1
     'near_expiry_otm_exit': 40,    # If < 1hr left AND price < 40¢ → EXIT (theta death)
 
     # -------------------------------------------------------------------------
     # UNIVERSAL RULES (apply to all zones)
     # -------------------------------------------------------------------------
-    'spread_collapse_threshold': 0.02,  # Exit when edge < 2%
-    'stop_loss_pct': -0.30,             # Exit at -30% loss
+    'spread_collapse_threshold': 0.00,  # DISABLED - was 0.05, don't exit on spread
+    'stop_loss_pct': -0.30,             # ACTIVE - Exit at -30% loss
     'min_position_size': 1,
+    'cooldown_minutes': 60,             # Don't sell positions less than 60 min old
 
     # -------------------------------------------------------------------------
     # MONITORING
@@ -744,13 +748,16 @@ class HedgeEngine:
                 market_prob = market.get('market_prob', price / 100.0)
                 ev = market.get('ev', model_prob - market_prob if model_prob else 0)
 
-                logger.info(f"Placing order: {ticker} x{quantity} @ {price}¢ | model_prob={model_prob:.2%}, market_prob={market_prob:.2%}, EV={ev:.2%}")
+                # Determine correct side for the order
+                hedge_side = market.get('hedge_side', 'yes')
+
+                logger.info(f"Placing order: {ticker} {hedge_side.upper()} x{quantity} @ {price}¢ | model_prob={model_prob:.2%}, market_prob={market_prob:.2%}, EV={ev:.2%}")
 
                 # Place order via Kalshi
                 order_result = self.kalshi_engine.place_order(
                     ticker=ticker,
                     action='buy',
-                    side='yes',
+                    side=hedge_side,
                     quantity=quantity,
                     order_type='limit',
                     price=price
@@ -761,6 +768,7 @@ class HedgeEngine:
                         'ticker': ticker,
                         'quantity': quantity,
                         'price': price,
+                        'side': hedge_side,
                         'order_id': order_result.get('order_id'),
                         'status': 'placed',
                         'model_prob': model_prob,
@@ -776,7 +784,7 @@ class HedgeEngine:
                         quantity=quantity,
                         model_prob=model_prob,
                         market_prob=market_prob,
-                        side='yes'
+                        side=hedge_side
                     )
                 else:
                     failed_orders.append({
@@ -1104,6 +1112,12 @@ class HedgeEngine:
         Recalculate current model probability for a position.
 
         Returns the probability for the side being traded.
+
+        Contract types:
+        - B (Below): YES = BTC < strike, NO = BTC >= strike
+        - T (Top/Above): YES = BTC > strike, NO = BTC <= strike
+
+        ProbabilityModel.get_probability() returns P(BTC < strike).
         """
         try:
             from market_data_service import get_market_data_service
@@ -1114,11 +1128,15 @@ class HedgeEngine:
             if not btc_price:
                 return None
 
-            # Parse strike from ticker (e.g., KXBTC-26JAN2215-B89000 -> 89000)
+            # Parse strike and contract type from ticker
+            # e.g., KXBTC-26JAN2215-B89000 -> B, 89000
+            # e.g., KXBTCD-26JAN2317-T88999.99 -> T, 88999.99
             parts = ticker.split('-')
             strike = None
+            contract_type = None  # 'B' = Below, 'T' = Top/Above
             for part in parts:
                 if part.startswith('B') or part.startswith('T'):
+                    contract_type = part[0]
                     try:
                         strike = float(part[1:])
                         break
@@ -1134,7 +1152,8 @@ class HedgeEngine:
             if hours is None:
                 hours = 24  # Default assumption
 
-            # Calculate model probability using ProbabilityModel (has get_probability method)
+            # Calculate model probability using ProbabilityModel
+            # get_probability() returns P(BTC < strike)
             market_data = get_market_data_service()
             returns = market_data.calculate_log_returns()
 
@@ -1147,13 +1166,21 @@ class HedgeEngine:
                 days_to_expiry=int(hours / 24) if hours >= 24 else 1
             )
 
-            model_prob_yes = prob_result.get('adjusted_prob', prob_result.get('base_prob', 0.5))
+            prob_below_strike = prob_result.get('adjusted_prob', prob_result.get('base_prob', 0.5))
+
+            # Convert P(below) to the YES probability for this contract type
+            if contract_type == 'T':
+                # T (Above): YES = BTC > strike = 1 - P(below)
+                yes_prob = 1 - prob_below_strike
+            else:
+                # B (Below): YES = BTC < strike = P(below)
+                yes_prob = prob_below_strike
 
             # Return probability for the traded side
             if side.lower() == 'yes':
-                return model_prob_yes
+                return yes_prob
             else:
-                return 1 - model_prob_yes
+                return 1 - yes_prob
 
         except Exception as e:
             logger.error(f"Error recalculating model prob for {ticker}: {e}")
@@ -1181,6 +1208,31 @@ class HedgeEngine:
 
         if current_quantity < CASH_OUT_CONFIG['min_position_size']:
             return {'action': 'HOLD', 'reason': 'Position too small', 'ticker': ticker}
+
+        # ---------------------------------------------------------------
+        # COOLDOWN: Don't sell positions that are less than N minutes old
+        # Prevents selling freshly-bought positions before they have time to move
+        # ---------------------------------------------------------------
+        entry_time_str = position.get('entry_time', '')
+        position_age_minutes = None
+        if entry_time_str:
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+                now = datetime.now(entry_dt.tzinfo)
+                position_age_minutes = (now - entry_dt).total_seconds() / 60
+                cooldown = CASH_OUT_CONFIG.get('cooldown_minutes', 60)
+
+                if position_age_minutes < cooldown:
+                    return {
+                        'action': 'HOLD',
+                        'reason': f"Cooldown: position is {position_age_minutes:.0f}min old (need {cooldown}min)",
+                        'trigger': None,
+                        'ticker': ticker,
+                        'entry_price': entry_price,
+                        'current_quantity': current_quantity,
+                    }
+            except Exception:
+                pass  # Can't parse time, skip cooldown check
 
         # Get current market price for the side we own
         current_price = self.get_current_market_price(ticker, side)
@@ -1268,12 +1320,13 @@ class HedgeEngine:
         # =================================================================
         if spread is not None and spread < CASH_OUT_CONFIG['spread_collapse_threshold']:
             # Exception: Don't exit deep ITM on spread collapse - let it ride to $1
-            if not deep_itm:
+            # Exception: Don't exit if currently profitable - edge captured, let it run
+            if not deep_itm and pnl_pct <= 0:
                 return {
                     'action': 'SELL',
                     'pct': 1.0,
                     'quantity': current_quantity,
-                    'reason': f"Spread collapsed ({spread*100:.1f}% < {CASH_OUT_CONFIG['spread_collapse_threshold']*100}% edge)",
+                    'reason': f"Spread collapsed ({spread*100:.1f}% < {CASH_OUT_CONFIG['spread_collapse_threshold']*100}% edge) and not profitable",
                     'trigger': 'spread_collapse',
                     **analytics
                 }
@@ -1647,6 +1700,35 @@ class HedgeEngine:
             except:
                 pass
 
+            # Determine "what needs to happen" for this position to profit
+            what_needs_to_happen = ''
+            try:
+                parts = ticker.split('-')
+                strike_part = parts[2] if len(parts) >= 3 else ''
+                contract_type = strike_part[0] if strike_part else ''  # B or T
+                strike_val = float(strike_part[1:]) if len(strike_part) > 1 else 0
+
+                btc_price = self.get_btc_spot_price() or 0
+                distance = abs(btc_price - strike_val)
+
+                if contract_type == 'B':
+                    # B (Below) contract: YES = BTC < strike, NO = BTC >= strike
+                    if side.lower() == 'yes':
+                        what_needs_to_happen = f"BTC falls below ${strike_val:,.0f}"
+                    else:
+                        what_needs_to_happen = f"BTC stays above ${strike_val:,.0f}"
+                elif contract_type == 'T':
+                    # T (Above) contract: YES = BTC > strike, NO = BTC <= strike
+                    if side.lower() == 'yes':
+                        what_needs_to_happen = f"BTC rises above ${strike_val:,.0f}"
+                    else:
+                        what_needs_to_happen = f"BTC stays below ${strike_val:,.0f}"
+
+                if btc_price and strike_val:
+                    what_needs_to_happen += f" (${distance:,.0f} away)"
+            except Exception:
+                pass
+
             positions.append({
                 'ticker': ticker,
                 'entry_price': entry_price,
@@ -1663,6 +1745,7 @@ class HedgeEngine:
                 'price_zone': price_zone,
                 'hours_to_expiry': round(hours_to_expiry, 1) if hours_to_expiry else None,
                 'expiry_display': expiry_display,
+                'what_needs_to_happen': what_needs_to_happen,
                 'cash_out_signal': cash_out_result.get('action', 'HOLD'),
                 'cash_out_reason': cash_out_result.get('reason', ''),
                 'cash_out_pct': cash_out_result.get('pct', 0)

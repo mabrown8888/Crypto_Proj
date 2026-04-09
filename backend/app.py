@@ -18,6 +18,7 @@ import requests
 import uuid
 from auto_trading_engine import AutoTradingEngine
 from enhanced_auto_trading_engine import EnhancedAutoTradingEngine
+from coinmarketcap_service import CoinMarketCapService
 from polymarket_engine import PolymarketEngine
 from kalshi_engine import KalshiEngine
 from hedge_engine import HedgeEngine
@@ -32,7 +33,7 @@ load_dotenv('../.env')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key'
-CORS(app, origins=["http://localhost:3000"], allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+CORS(app, origins=["http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000", "http://127.0.0.1:3001"], allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Global variables to store bot data
@@ -121,6 +122,7 @@ class TradingBotAdapter:
     def __init__(self):
         self.running = False
         self.coinbase_client = None
+        self.cmc = CoinMarketCapService()
         self._init_coinbase_client()
         
     def _init_coinbase_client(self):
@@ -174,18 +176,26 @@ class TradingBotAdapter:
                 self._fetch_market_sentiment()
                 self._monitor_whale_activity()
                 
-                # Update multi-crypto data
+                # Update multi-crypto data (CMC primary, CoinGecko fallback)
                 self.update_crypto_data()
-                
+
+                # Fetch CMC global metrics and emit as trading signals
+                cmc_signals = self.cmc.get_trading_signals()
+                global_metrics = self.cmc.get_global_metrics()
+
                 # Update portfolio breakdown
                 portfolio_breakdown = self.get_portfolio_breakdown()
-                
+
                 # Emit updates to connected clients
                 socketio.emit('bot_update', bot_data)
                 socketio.emit('sentiment_update', sentiment_data)
                 socketio.emit('whale_update', whale_data)
                 socketio.emit('crypto_update', crypto_data)
                 socketio.emit('portfolio_update', portfolio_breakdown)
+                if global_metrics:
+                    socketio.emit('cmc_global_update', global_metrics)
+                if cmc_signals:
+                    socketio.emit('cmc_signals_update', cmc_signals)
                 
                 time.sleep(30)  # Update every 30 seconds
                 
@@ -486,70 +496,75 @@ class TradingBotAdapter:
             }
 
     def update_crypto_data(self):
-        """Update data for all supported cryptocurrencies"""
+        """Update data for all supported cryptocurrencies. Primary: CMC. Fallback: CoinGecko."""
         try:
-            # Map of our symbols to CoinGecko IDs
-            coingecko_mapping = {
-                'BTC-USDC': 'bitcoin',
-                'ETH-USDC': 'ethereum', 
-                'SOL-USDC': 'solana',
-                'ADA-USDC': 'cardano',
-                'DOGE-USDC': 'dogecoin',
-                'AVAX-USDC': 'avalanche-2',
-                'MATIC-USDC': 'matic-network',
-                'LINK-USDC': 'chainlink'
-            }
-            
-            # Get data from CoinGecko (more comprehensive than individual Coinbase calls)
-            coin_ids = ','.join(coingecko_mapping.values())
-            response = requests.get(
-                f'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={coin_ids}&order=market_cap_desc&per_page=20&page=1&sparkline=false&price_change_percentage=24h',
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                for coin in data:
-                    # Find corresponding symbol
-                    symbol = None
-                    for pair, cg_id in coingecko_mapping.items():
-                        if cg_id == coin['id']:
-                            symbol = pair
-                            break
-                    
-                    if symbol and symbol in crypto_data:
-                        crypto_data[symbol].update({
-                            'price': coin.get('current_price', 0),
-                            'change_24h': coin.get('price_change_percentage_24h', 0),
-                            'volume_24h': coin.get('total_volume', 0),
-                            'market_cap': coin.get('market_cap', 0),
+            # --- Primary: CoinMarketCap (authenticated, reliable) ---
+            cmc_quotes = self.cmc.get_quotes()
+            if cmc_quotes:
+                from coinmarketcap_service import PAIR_TO_CMC
+                for pair, cmc_symbol in PAIR_TO_CMC.items():
+                    quote = cmc_quotes.get(cmc_symbol)
+                    if quote and pair in crypto_data:
+                        crypto_data[pair].update({
+                            'price': quote['price'],
+                            'change_24h': quote['change_24h'],
+                            'change_1h': quote['change_1h'],
+                            'change_7d': quote['change_7d'],
+                            'volume_24h': quote['volume_24h'],
+                            'market_cap': quote['market_cap'],
+                            'cmc_rank': quote['cmc_rank'],
+                            'volume_change_24h': quote['volume_change_24h'],
                             'last_update': datetime.now().isoformat()
                         })
-                        
-                        # Add to price history
-                        crypto_data[symbol]['price_history'].append({
+                        crypto_data[pair]['price_history'].append({
                             'timestamp': datetime.now().isoformat(),
-                            'price': coin.get('current_price', 0)
+                            'price': quote['price']
                         })
-                        
-                        # Keep only last 100 points
-                        if len(crypto_data[symbol]['price_history']) > 100:
-                            crypto_data[symbol]['price_history'] = crypto_data[symbol]['price_history'][-100:]
-                
-                # Also try to get real Coinbase data for major pairs
-                if self.coinbase_client:
-                    for symbol in ['BTC-USDC', 'ETH-USDC', 'SOL-USDC']:
-                        try:
-                            ticker = self.coinbase_client.get_product(symbol)
-                            if ticker and hasattr(ticker, 'price'):
-                                # Override with more accurate Coinbase price if available
-                                crypto_data[symbol]['price'] = float(ticker.price)
-                        except Exception as e:
-                            logging.debug(f"Could not get Coinbase price for {symbol}: {e}")
-                            
-                logging.info(f"Updated crypto data for {len(crypto_data)} cryptocurrencies")
-                
+                        if len(crypto_data[pair]['price_history']) > 100:
+                            crypto_data[pair]['price_history'] = crypto_data[pair]['price_history'][-100:]
+                logging.info(f"Updated crypto data via CMC for {len(cmc_quotes)} coins")
+            else:
+                # --- Fallback: CoinGecko (free, rate-limited) ---
+                logging.warning("CMC unavailable, falling back to CoinGecko")
+                coingecko_mapping = {
+                    'BTC-USDC': 'bitcoin', 'ETH-USDC': 'ethereum',
+                    'SOL-USDC': 'solana', 'ADA-USDC': 'cardano',
+                    'DOGE-USDC': 'dogecoin', 'AVAX-USDC': 'avalanche-2',
+                    'MATIC-USDC': 'matic-network', 'LINK-USDC': 'chainlink'
+                }
+                coin_ids = ','.join(coingecko_mapping.values())
+                response = requests.get(
+                    f'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={coin_ids}&order=market_cap_desc&per_page=20&page=1&sparkline=false&price_change_percentage=24h',
+                    timeout=10
+                )
+                if response.status_code == 200:
+                    for coin in response.json():
+                        symbol = next((p for p, cg in coingecko_mapping.items() if cg == coin['id']), None)
+                        if symbol and symbol in crypto_data:
+                            crypto_data[symbol].update({
+                                'price': coin.get('current_price', 0),
+                                'change_24h': coin.get('price_change_percentage_24h', 0),
+                                'volume_24h': coin.get('total_volume', 0),
+                                'market_cap': coin.get('market_cap', 0),
+                                'last_update': datetime.now().isoformat()
+                            })
+                            crypto_data[symbol]['price_history'].append({
+                                'timestamp': datetime.now().isoformat(),
+                                'price': coin.get('current_price', 0)
+                            })
+                            if len(crypto_data[symbol]['price_history']) > 100:
+                                crypto_data[symbol]['price_history'] = crypto_data[symbol]['price_history'][-100:]
+
+            # Override BTC/ETH/SOL with real-time Coinbase price when available
+            if self.coinbase_client:
+                for symbol in ['BTC-USDC', 'ETH-USDC', 'SOL-USDC']:
+                    try:
+                        ticker = self.coinbase_client.get_product(symbol)
+                        if ticker and hasattr(ticker, 'price'):
+                            crypto_data[symbol]['price'] = float(ticker.price)
+                    except Exception as e:
+                        logging.debug(f"Could not get Coinbase price for {symbol}: {e}")
+
         except Exception as e:
             logging.error(f"Error updating crypto data: {e}")
             
@@ -1246,8 +1261,9 @@ class TradingBotAdapter:
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    if 'Data' in data:
-                        for article in data['Data'][:10]:  # Get top 10 articles
+                    articles_data = data.get('Data', [])
+                    if isinstance(articles_data, list):
+                        for article in articles_data[:10]:  # Get top 10 articles
                             title = article.get('title', '')
                             body = article.get('body', '')[:200]  # First 200 chars
                             
@@ -3584,6 +3600,14 @@ def get_kalshi_opportunities():
         opportunities = []
         recommended_trades = []
 
+        # Log all decisions (buys + skips) for the explanation endpoint
+        all_decisions = list(raw_opportunities)
+        if hasattr(trader, '_rejected_opportunities'):
+            all_decisions.extend(trader._rejected_opportunities or [])
+        for opp in all_decisions:
+            if opp.get('explanation'):
+                _log_decision(opp)
+
         for opp in raw_opportunities:
             # Convert numpy types to Python native types for JSON serialization
             ev_val = float(opp.get('ev', 0))
@@ -3614,7 +3638,9 @@ def get_kalshi_opportunities():
                 'signal_confidence': float(round(opp.get('signal_confidence', 0.5), 2)),  # Signal agreement
                 'high_edge_override': bool(opp.get('high_edge_override', False)),  # Whether high edge override was used
                 # Filtering passes if: raw EV >= 1% AND risk-adjusted EV >= 0.5
-                'recommended': bool(ev_val >= 0.01 and ev_adj_val >= 0.5)
+                'recommended': bool(ev_val >= 0.01 and ev_adj_val >= 0.5),
+                'explanation': opp.get('explanation', ''),
+                'decision': opp.get('decision', 'BUY'),
             }
             opportunities.append(formatted)
 
@@ -3971,7 +3997,12 @@ def btc_monitor():
 
                     for p in result["market_positions"]:
                         ticker = p.get("ticker", "")
-                        pos = p.get("position", 0)
+                        # API now returns position_fp (string) instead of position (int)
+                        pos_raw = p.get("position") if p.get("position") is not None else p.get("position_fp", "0")
+                        try:
+                            pos = float(pos_raw)
+                        except (ValueError, TypeError):
+                            pos = 0
 
                         # Only include KXBTC positions with active positions
                         if "KXBTC" not in ticker or pos == 0:
@@ -4079,8 +4110,15 @@ def btc_monitor():
                                 except:
                                     pass
 
-                        # Calculate position metrics
-                        cost = p.get("total_traded", 0) / 100
+                        # Calculate position metrics — handle _dollars suffix
+                        total_traded_raw = p.get("total_traded_dollars") or p.get("total_traded", 0)
+                        try:
+                            cost = float(total_traded_raw)
+                            # If it came from the old cents field, divide by 100
+                            if p.get("total_traded_dollars") is None:
+                                cost /= 100
+                        except (ValueError, TypeError):
+                            cost = 0
                         avg_price = cost / abs_pos if abs_pos > 0 else 0
                         potential_payout = abs_pos * 1.0  # $1 per contract if wins
 
@@ -5882,6 +5920,536 @@ def monitor_status_endpoint():
     })
 
 
+# ============================================================================
+# DATA COLLECTION ENDPOINTS - For ML Model Training
+# ============================================================================
+
+# Background data collection settings
+data_collector_running = False
+DATA_SNAPSHOT_INTERVAL = 3600  # Collect snapshot every hour
+SETTLEMENT_SYNC_INTERVAL = 1800  # Sync settlements every 30 min
+data_collector_instance = None
+
+
+def run_data_collector():
+    """Background thread that automatically collects data."""
+    global data_collector_running, data_collector_instance
+
+    logging.info("Starting automatic data collector...")
+
+    try:
+        from data_collector import DataCollector
+        data_collector_instance = DataCollector()
+    except Exception as e:
+        logging.error(f"Failed to initialize data collector: {e}")
+        return
+
+    last_snapshot = 0
+    last_sync = 0
+
+    while data_collector_running:
+        try:
+            current_time = time.time()
+
+            # Collect daily snapshot every hour
+            if current_time - last_snapshot >= DATA_SNAPSHOT_INTERVAL:
+                logging.info("[DataCollector] Collecting market snapshot...")
+                try:
+                    snapshot = data_collector_instance.collect_daily_snapshot()
+                    logging.info(f"[DataCollector] Snapshot collected: BTC=${snapshot.get('btc_price', 0):,.2f}, "
+                               f"Vol={snapshot.get('garch_vol_1d', 0):.1%}")
+
+                    # Store volatility prediction
+                    if 'garch_vol_1d' in snapshot:
+                        data_collector_instance.store_volatility_prediction(24, snapshot['garch_vol_1d'])
+
+                    last_snapshot = current_time
+                except Exception as e:
+                    logging.error(f"[DataCollector] Snapshot error: {e}")
+
+            # Sync settlements every 30 min
+            if current_time - last_sync >= SETTLEMENT_SYNC_INTERVAL:
+                logging.info("[DataCollector] Syncing Kalshi settlements...")
+                try:
+                    if kalshi_engine and kalshi_engine.is_connected:
+                        new_markets = data_collector_instance.collect_kalshi_settled_markets(kalshi_engine)
+                        if new_markets > 0:
+                            logging.info(f"[DataCollector] Synced {new_markets} new settled markets")
+
+                        # Update trade outcomes
+                        update_trade_outcomes_background()
+
+                        # Calculate daily performance
+                        data_collector_instance.calculate_daily_performance()
+
+                    last_sync = current_time
+                except Exception as e:
+                    logging.error(f"[DataCollector] Sync error: {e}")
+
+            # Sleep for 60 seconds between checks
+            time.sleep(60)
+
+        except Exception as e:
+            logging.error(f"[DataCollector] Error in collection loop: {e}")
+            time.sleep(60)
+
+    logging.info("Data collector stopped")
+
+
+def update_trade_outcomes_background():
+    """Update trade outcomes from settled markets."""
+    import sqlite3
+
+    if not data_collector_instance:
+        return
+
+    try:
+        conn = sqlite3.connect(data_collector_instance.db_path)
+        cursor = conn.cursor()
+
+        # Get trades without outcomes
+        cursor.execute('''
+            SELECT trade_id, ticker, side, entry_price
+            FROM trades
+            WHERE outcome IS NULL
+        ''')
+
+        pending_trades = cursor.fetchall()
+        conn.close()
+
+        for trade_id, ticker, side, entry_price in pending_trades:
+            try:
+                # Check if market has settled
+                result = kalshi_engine._make_authenticated_request('GET', f'/markets/{ticker}')
+
+                if result and result.get('status') == 'settled':
+                    market_result = result.get('result')  # 'yes' or 'no'
+
+                    # Get current BTC price
+                    try:
+                        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10)
+                        btc_price = float(r.json()['data']['amount'])
+                    except:
+                        btc_price = 0
+
+                    # Determine if we won
+                    if side == 'yes':
+                        outcome = 'won' if market_result == 'yes' else 'lost'
+                        exit_price = 100 if market_result == 'yes' else 0
+                    else:
+                        outcome = 'won' if market_result == 'no' else 'lost'
+                        exit_price = 100 if market_result == 'no' else 0
+
+                    data_collector_instance.update_trade_outcome(ticker, outcome, exit_price, btc_price)
+                    logging.info(f"[DataCollector] Trade {ticker} settled: {outcome}")
+
+            except Exception as e:
+                logging.debug(f"Could not check settlement for {ticker}: {e}")
+
+    except Exception as e:
+        logging.error(f"Error updating trade outcomes: {e}")
+
+
+def start_data_collector():
+    """Start the background data collector."""
+    global data_collector_running
+
+    if data_collector_running:
+        logging.info("Data collector already running")
+        return
+
+    data_collector_running = True
+    thread = threading.Thread(target=run_data_collector, daemon=True)
+    thread.start()
+    logging.info("Data collector thread started")
+
+
+def stop_data_collector():
+    """Stop the background data collector."""
+    global data_collector_running
+    data_collector_running = False
+    logging.info("Data collector stopping...")
+
+
+@app.route('/api/data/collector/start', methods=['POST'])
+def start_collector_endpoint():
+    """Start the automatic data collector."""
+    start_data_collector()
+    return jsonify({'success': True, 'message': 'Data collector started'})
+
+
+@app.route('/api/data/collector/stop', methods=['POST'])
+def stop_collector_endpoint():
+    """Stop the automatic data collector."""
+    stop_data_collector()
+    return jsonify({'success': True, 'message': 'Data collector stopped'})
+
+
+@app.route('/api/data/collector/status')
+def collector_status_endpoint():
+    """Get data collector status."""
+    return jsonify({
+        'success': True,
+        'running': data_collector_running,
+        'snapshot_interval_seconds': DATA_SNAPSHOT_INTERVAL,
+        'sync_interval_seconds': SETTLEMENT_SYNC_INTERVAL
+    })
+
+
+@app.route('/api/data/collect-snapshot', methods=['POST'])
+def collect_data_snapshot():
+    """Manually trigger a data snapshot collection."""
+    try:
+        from data_collector import DataCollector
+        collector = DataCollector()
+        snapshot = collector.collect_daily_snapshot()
+        return jsonify({
+            'success': True,
+            'snapshot': {
+                'timestamp': snapshot.get('timestamp'),
+                'btc_price': snapshot.get('btc_price'),
+                'garch_vol_1d': snapshot.get('garch_vol_1d'),
+                'rsi_14': snapshot.get('rsi_14'),
+                'momentum_24h': snapshot.get('momentum_24h'),
+                'fear_greed_index': snapshot.get('fear_greed_index'),
+            }
+        })
+    except Exception as e:
+        logging.error(f"Error collecting snapshot: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data/sync-settlements', methods=['POST'])
+def sync_settlements():
+    """Sync settled Kalshi markets and update trade outcomes."""
+    try:
+        from data_collector import DataCollector
+        collector = DataCollector()
+
+        # Collect settled markets
+        if kalshi_engine and kalshi_engine.is_connected:
+            new_markets = collector.collect_kalshi_settled_markets(kalshi_engine)
+
+            # Calculate performance
+            performance = collector.calculate_daily_performance()
+
+            return jsonify({
+                'success': True,
+                'new_markets_synced': new_markets,
+                'performance': performance
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Kalshi not connected'})
+    except Exception as e:
+        logging.error(f"Error syncing settlements: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data/training-stats')
+def get_training_stats():
+    """Get statistics about collected training data."""
+    try:
+        from data_collector import DataCollector
+        import sqlite3
+
+        collector = DataCollector()
+        conn = sqlite3.connect(collector.db_path)
+        cursor = conn.cursor()
+
+        # Count records in each table
+        stats = {}
+
+        cursor.execute('SELECT COUNT(*) FROM daily_snapshots')
+        stats['daily_snapshots'] = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM trades')
+        stats['total_trades'] = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM trades WHERE outcome IS NOT NULL')
+        stats['settled_trades'] = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM kalshi_settled_markets')
+        stats['kalshi_markets'] = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM volatility_predictions')
+        stats['vol_predictions'] = cursor.fetchone()[0]
+
+        # Recent snapshot
+        cursor.execute('SELECT timestamp, btc_price, garch_vol_1d FROM daily_snapshots ORDER BY timestamp DESC LIMIT 1')
+        row = cursor.fetchone()
+        if row:
+            stats['latest_snapshot'] = {
+                'timestamp': row[0],
+                'btc_price': row[1],
+                'garch_vol': row[2]
+            }
+
+        # Trade performance
+        cursor.execute('''
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN outcome = 'won' THEN 1 ELSE 0 END) as wins,
+                SUM(pnl) as total_pnl
+            FROM trades
+            WHERE outcome IS NOT NULL
+        ''')
+        perf = cursor.fetchone()
+        if perf[0] > 0:
+            stats['trade_performance'] = {
+                'total': perf[0],
+                'wins': perf[1],
+                'win_rate': perf[1] / perf[0] if perf[0] > 0 else 0,
+                'total_pnl': perf[2] or 0
+            }
+
+        conn.close()
+        return jsonify({'success': True, 'stats': stats})
+    except Exception as e:
+        logging.error(f"Error getting training stats: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data/signal-performance')
+def get_signal_performance():
+    """Get performance analysis of each signal."""
+    try:
+        from data_collector import DataCollector
+        collector = DataCollector()
+        report = collector.get_signal_performance_report()
+
+        if report.empty:
+            return jsonify({
+                'success': True,
+                'signals': [],
+                'message': 'Not enough data for signal analysis'
+            })
+
+        return jsonify({
+            'success': True,
+            'signals': report.to_dict('records')
+        })
+    except Exception as e:
+        logging.error(f"Error getting signal performance: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data/performance-report')
+def get_performance_report():
+    """Get comprehensive performance report."""
+    try:
+        from data_collector import DataCollector
+        import sqlite3
+
+        collector = DataCollector()
+        conn = sqlite3.connect(collector.db_path)
+        cursor = conn.cursor()
+
+        report = {}
+
+        # Overall stats
+        cursor.execute('''
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN outcome = 'won' THEN 1 ELSE 0 END) as wins,
+                SUM(pnl) as total_pnl,
+                AVG(pnl) as avg_pnl
+            FROM trades
+            WHERE outcome IS NOT NULL
+        ''')
+        row = cursor.fetchone()
+        if row[0] > 0:
+            report['overall'] = {
+                'total_trades': row[0],
+                'wins': row[1],
+                'losses': row[0] - row[1],
+                'win_rate': row[1] / row[0],
+                'total_pnl': row[2] or 0,
+                'avg_pnl': row[3] or 0
+            }
+
+        # By direction
+        cursor.execute('''
+            SELECT
+                trade_direction,
+                COUNT(*) as trades,
+                SUM(CASE WHEN outcome = 'won' THEN 1 ELSE 0 END) as wins,
+                SUM(pnl) as pnl
+            FROM trades
+            WHERE outcome IS NOT NULL AND trade_direction IS NOT NULL
+            GROUP BY trade_direction
+        ''')
+        report['by_direction'] = {}
+        for row in cursor.fetchall():
+            report['by_direction'][row[0]] = {
+                'trades': row[1],
+                'wins': row[2],
+                'win_rate': row[2] / row[1] if row[1] > 0 else 0,
+                'pnl': row[3] or 0
+            }
+
+        # By trend alignment
+        cursor.execute('''
+            SELECT
+                trend_aligned,
+                COUNT(*) as trades,
+                SUM(CASE WHEN outcome = 'won' THEN 1 ELSE 0 END) as wins,
+                SUM(pnl) as pnl
+            FROM trades
+            WHERE outcome IS NOT NULL
+            GROUP BY trend_aligned
+        ''')
+        report['by_trend'] = {}
+        for row in cursor.fetchall():
+            label = 'with_trend' if row[0] else 'against_trend'
+            report['by_trend'][label] = {
+                'trades': row[1],
+                'wins': row[2],
+                'win_rate': row[2] / row[1] if row[1] > 0 else 0,
+                'pnl': row[3] or 0
+            }
+
+        # Daily performance (last 7 days)
+        cursor.execute('''
+            SELECT date, total_trades, win_rate, total_pnl
+            FROM model_performance
+            ORDER BY date DESC
+            LIMIT 7
+        ''')
+        report['daily'] = []
+        for row in cursor.fetchall():
+            report['daily'].append({
+                'date': row[0],
+                'trades': row[1],
+                'win_rate': row[2],
+                'pnl': row[3]
+            })
+
+        conn.close()
+        return jsonify({'success': True, 'report': report})
+    except Exception as e:
+        logging.error(f"Error getting performance report: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/data/retrain-model', methods=['POST'])
+def retrain_model():
+    """Trigger ML model retraining."""
+    try:
+        from scheduled_tasks import retrain_ml_model
+        success = retrain_ml_model()
+        return jsonify({
+            'success': success,
+            'message': 'Model retrained successfully' if success else 'Not enough data for retraining'
+        })
+    except Exception as e:
+        logging.error(f"Error retraining model: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+# ─── CoinMarketCap Endpoints ─────────────────────────────────────────────────
+
+@app.route('/api/cmc/global')
+def cmc_global():
+    """
+    Global crypto market metrics: total market cap, BTC dominance, market regime.
+    Cached 5 min. Use for macro market context and regime classification.
+    """
+    data = bot_adapter.cmc.get_global_metrics()
+    if data:
+        return jsonify(data)
+    return jsonify({'error': 'CMC unavailable or API key not set'}), 503
+
+
+@app.route('/api/cmc/quotes')
+def cmc_quotes():
+    """
+    Latest quotes for all tracked coins (BTC, ETH, SOL, ADA, DOGE, AVAX, MATIC, LINK).
+    Includes price, market_cap, volume, 1h/24h/7d % changes, CMC rank.
+    Cached 5 min.
+    """
+    data = bot_adapter.cmc.get_quotes()
+    if data:
+        return jsonify(data)
+    return jsonify({'error': 'CMC unavailable or API key not set'}), 503
+
+
+@app.route('/api/cmc/signals')
+def cmc_signals():
+    """
+    Derived trading signals from CMC data for use by the bot:
+      btc_dominance, market_cap_momentum, market_regime, btc_dominance_signal, altcoin_season.
+    """
+    data = bot_adapter.cmc.get_trading_signals()
+    return jsonify(data)
+
+
+@app.route('/api/cmc/movers')
+def cmc_movers():
+    """
+    Top gainers, top losers, and volume spikes from top-100 coins by market cap.
+    Cached 10 min.
+    """
+    data = bot_adapter.cmc.get_top_movers()
+    if data:
+        return jsonify(data)
+    return jsonify({'error': 'CMC unavailable or API key not set'}), 503
+
+
+# ─── Trade Decision Explanations ─────────────────────────────────────────────
+
+# In-memory log of recent decisions (buy + skip), capped at 200 entries
+_decision_log = []
+
+def _log_decision(opp: dict):
+    """Append a trade decision to the in-memory log."""
+    _decision_log.append({
+        'ticker': opp.get('ticker', ''),
+        'decision': opp.get('decision', ''),
+        'explanation': opp.get('explanation', ''),
+        'timestamp': opp.get('decision_timestamp', ''),
+        'market_type': opp.get('market_type', 'range'),
+        'lower': opp.get('lower'),
+        'upper': opp.get('upper'),
+        'threshold': opp.get('threshold'),
+        'side': opp.get('side', ''),
+        'model_prob': opp.get('model_prob', 0),
+        'market_prob': opp.get('market_prob', 0),
+        'ev': opp.get('ev', 0),
+        'ev_adjusted': opp.get('ev_adjusted', 0),
+        'ml_score': opp.get('ml_score', 0),
+        'hours': opp.get('hours', 0),
+    })
+    if len(_decision_log) > 200:
+        _decision_log.pop(0)
+
+
+@app.route('/api/kalshi/decisions')
+def kalshi_decisions():
+    """
+    Recent Kalshi trade decisions with plain-English explanations.
+    Returns last N decisions (buys + skips), newest first.
+    Query params:
+      ?limit=20       — number of decisions (default 20)
+      ?decision=BUY   — filter by BUY or SKIP
+    """
+    limit = int(request.args.get('limit', 20))
+    decision_filter = request.args.get('decision', '').upper()
+
+    results = list(reversed(_decision_log))
+    if decision_filter in ('BUY', 'SKIP'):
+        results = [d for d in results if d['decision'] == decision_filter]
+
+    return jsonify(results[:limit])
+
+
+@app.route('/api/kalshi/decisions/latest')
+def kalshi_latest_decision():
+    """Most recent trade decision with full explanation."""
+    if not _decision_log:
+        return jsonify({'message': 'No decisions recorded yet'}), 404
+    return jsonify(_decision_log[-1])
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     print("Starting AI Trading Co-Pilot Backend...")
@@ -5896,6 +6464,11 @@ if __name__ == '__main__':
     # Cash-out monitor does NOT auto-start
     # User must click "Start Cash-Outs" button in dashboard to enable
     print("Cash-out monitor ready (start via dashboard button)")
+
+    # Auto-start data collector for ML training
+    print("Starting automatic data collector for ML training...")
+    start_data_collector()
+    print("Data collector running - snapshots every hour, settlements every 30 min")
 
     # Run the Flask-SocketIO app
     socketio.run(app, host='127.0.0.1', port=5001, debug=False, allow_unsafe_werkzeug=True)

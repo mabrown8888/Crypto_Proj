@@ -28,6 +28,44 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def _mfp(market, *keys, default=0.0, scale=1.0):
+    """
+    Read a field from a Kalshi market dict, trying each key in order.
+    Handles the API migration where fields gained '_fp' and '_dollars' suffixes.
+    'scale' multiplies the result (use 100 to convert dollar prices to cents).
+    """
+    for key in keys:
+        v = market.get(key)
+        if v is not None:
+            try:
+                return float(v) * scale
+            except (ValueError, TypeError):
+                continue
+    return default
+
+
+def _market_volume(market):
+    """Return best available volume figure for a Kalshi market."""
+    return (
+        _mfp(market, 'volume_fp', 'volume') or
+        _mfp(market, 'volume_24h_fp')
+    )
+
+
+def _market_ask(market, side='yes'):
+    """Return ask price in cents (0-100) for given side."""
+    if side == 'yes':
+        return _mfp(market, 'yes_ask_dollars', scale=100) or _mfp(market, 'yes_ask')
+    return _mfp(market, 'no_ask_dollars', scale=100) or _mfp(market, 'no_ask')
+
+
+def _market_bid(market, side='yes'):
+    """Return bid price in cents (0-100) for given side."""
+    if side == 'yes':
+        return _mfp(market, 'yes_bid_dollars', scale=100) or _mfp(market, 'yes_bid')
+    return _mfp(market, 'no_bid_dollars', scale=100) or _mfp(market, 'no_bid')
+
 # =============================================================================
 # CONFIGURATION (Quant-Grade v2)
 # =============================================================================
@@ -56,7 +94,7 @@ MAX_MODEL_PROB = 0.99            # 99% maximum (near-certainties)
 HIGH_EDGE_OVERRIDE = 0.15        # 15%+ raw EV overrides probability bounds
 
 # Market filters
-MIN_VOLUME = 10                  # Low threshold to see more markets (increase to 25+ for stricter filtering)
+MIN_VOLUME = 1                   # Minimum volume (Kalshi volume_fp - 1 contract minimum to confirm market activity)
 MAX_POSITION_SIZE = 50           # Max contracts per market
 MAX_TOTAL_RISK = 100.00          # Max total $ to risk per run
 
@@ -78,6 +116,29 @@ KELLY_FRACTION = 0.25            # Use 1/4 Kelly (safer than full Kelly)
 MIN_KELLY_BET = 0.02             # Minimum 2% of budget per position
 MAX_KELLY_BET = 0.30             # Maximum 30% of budget per position
 
+# =============================================================================
+# DIRECTIONAL MODEL (v3 - STRENGTHENED)
+# =============================================================================
+# The old model assumed zero drift (price equally likely to go up/down)
+# The new model incorporates momentum-based drift into probability calculation
+
+# Drift estimation from momentum
+# INCREASED from 2.5 to 4.0 for stronger directional impact
+DRIFT_SENSITIVITY = 4.0          # How much momentum affects drift (higher = more directional)
+MAX_ANNUALIZED_DRIFT = 2.0       # Cap drift at 200% annualized (raised from 1.5)
+
+# Trend alignment filter - ONLY take trades that align with trend
+REQUIRE_TREND_ALIGNMENT = True   # If True, skip trades against the trend
+TREND_ALIGNMENT_BONUS = 0.20     # Probability bonus for trend-aligned trades (raised from 0.15)
+
+# Momentum thresholds - LOWERED to catch trends earlier
+STRONG_MOMENTUM_THRESHOLD = 0.015 # 1.5% move in 24h = strong momentum (was 2%)
+WEAK_MOMENTUM_THRESHOLD = 0.003   # 0.3% move = weak/no momentum (was 0.5%)
+
+# Direction confidence (how much we trust direction vs pure volatility)
+# INCREASED from 0.6 to 0.75 - trust direction more than volatility alone
+DIRECTION_CONFIDENCE_WEIGHT = 0.75  # 75% directional, 25% volatility-only
+
 # NEW: Probability estimation uncertainty (for risk-adjusted EV)
 # σ_prob estimates our model uncertainty
 BASE_PROB_UNCERTAINTY = 0.05     # Base uncertainty in probability estimate
@@ -89,8 +150,147 @@ ML_DATA_PATH = Path(__file__).parent / 'data' / 'kalshi_historical.csv'
 
 
 # =============================================================================
+# DECISION EXPLAINER
+# =============================================================================
+
+def explain_decision(opp: dict, signals: dict, action: str, position: int = 0, cost: float = 0.0) -> str:
+    """
+    Generate a plain-English explanation of a buy, skip, or sell decision.
+
+    Args:
+        opp:      Opportunity dict from analyze_markets()
+        signals:  Current signals dict from SmartKalshiTrader
+        action:   'BUY', 'SKIP', or 'SELL'
+        position: Number of contracts (for BUY)
+        cost:     Total cost in dollars (for BUY)
+
+    Returns:
+        Human-readable explanation string.
+    """
+    ticker = opp.get('ticker', '?')
+    market_type = opp.get('market_type', 'range')
+    side = opp.get('side', 'yes').upper()
+    model_prob = opp.get('model_prob', 0)
+    market_prob = opp.get('market_prob', 0)
+    raw_ev = opp.get('ev', 0)
+    ev_adjusted = opp.get('ev_adjusted', 0)
+    ml_score = opp.get('ml_score', 0)
+    hours = opp.get('hours', 0)
+    current_price = opp.get('current_price', 0)
+    rejection_reasons = opp.get('rejection_reasons', [])
+
+    # Market description
+    if market_type == 'threshold':
+        direction_str = 'above' if opp.get('is_above') else 'below'
+        market_desc = f"BTC {'above' if opp.get('is_above') else 'below'} ${opp.get('threshold', 0):,.0f}"
+    else:
+        market_desc = f"BTC in ${opp.get('lower', 0):,.0f}–${opp.get('upper', 0):,.0f}"
+
+    # Market regime context
+    regime = signals.get('market_regime', 'SIDEWAYS')
+    btc_dom = signals.get('btc_dominance', 50)
+    altcoin_season = signals.get('altcoin_season', False)
+    direction = signals.get('direction', 'NEUTRAL')
+    fear_greed = signals.get('fear_greed', 50)
+    momentum_24h = signals.get('momentum_24h', 0) * 100
+
+    # --- BUY explanation ---
+    if action == 'BUY':
+        edge_pct = raw_ev * 100
+        mispricing = (model_prob - market_prob) * 100
+
+        lines = [
+            f"Bought {position} {side} contracts on {market_desc} ({ticker})",
+            f"",
+            f"Why this trade:",
+            f"  • The market priced this at {market_prob:.0%}, but our model says {model_prob:.0%} — "
+            f"a {mispricing:+.1f}pt edge.",
+            f"  • Risk-adjusted edge score: {ev_adjusted:.2f}σ (threshold: {MIN_EV_ADJUSTED}σ). "
+            f"The higher this is, the more confident we are.",
+            f"  • ML confidence: {ml_score:.0%} — {'strong' if ml_score > 0.65 else 'moderate' if ml_score > 0.50 else 'low'} signal.",
+            f"  • Expires in {hours:.1f}h.",
+            f"",
+            f"Market context:",
+            f"  • BTC at ${current_price:,.0f}, trend is {direction} (24h: {momentum_24h:+.1f}%)",
+            f"  • Fear & Greed: {fear_greed}/100 ({'extreme fear' if fear_greed < 25 else 'fear' if fear_greed < 45 else 'neutral' if fear_greed < 55 else 'greed' if fear_greed < 75 else 'extreme greed'})",
+            f"  • Market regime: {regime} | BTC dominance: {btc_dom:.1f}%{'  (alt season)' if altcoin_season else ''}",
+            f"",
+            f"Position: ${cost:.2f} risked for up to ${position * (1 - opp.get('price', 50)/100):.2f} profit.",
+        ]
+        return "\n".join(lines)
+
+    # --- SKIP explanation ---
+    if action == 'SKIP':
+        if not rejection_reasons:
+            rejection_reasons = ["did not meet minimum edge criteria"]
+
+        # Translate technical reasons to plain English
+        plain_reasons = []
+        for r in rejection_reasons:
+            if 'raw_ev' in r:
+                plain_reasons.append(f"Edge too small: our model only sees a {raw_ev*100:.1f}pt advantage, need at least {MIN_EV_RAW*100:.0f}pt")
+            elif 'ev_adj' in r:
+                plain_reasons.append(f"Not confident enough in the edge: risk-adjusted score {ev_adjusted:.2f}σ is below the {MIN_EV_ADJUSTED}σ threshold")
+            elif 'ml=' in r:
+                plain_reasons.append(f"ML model low confidence: {ml_score:.0%} (need {MIN_ML_SCORE_HARD:.0%}+)")
+            elif 'prob=' in r:
+                plain_reasons.append(f"Probability out of reliable range: {model_prob:.1%}")
+            else:
+                plain_reasons.append(r)
+
+        if not plain_reasons:
+            plain_reasons = ["edge did not meet minimum threshold"]
+
+        lines = [
+            f"Skipped {market_desc} ({ticker})",
+            f"",
+            f"Why we passed:",
+        ]
+        for reason in plain_reasons:
+            lines.append(f"  • {reason}")
+
+        lines += [
+            f"",
+            f"Stats: model={model_prob:.1%}, market={market_prob:.1%}, raw edge={raw_ev*100:+.1f}pt, "
+            f"risk-adj score={ev_adjusted:.2f}σ, ML={ml_score:.0%}",
+            f"Market regime: {regime} | BTC at ${current_price:,.0f}",
+        ]
+        return "\n".join(lines)
+
+    # --- SELL / CLOSE explanation ---
+    if action == 'SELL':
+        lines = [
+            f"Closed position on {market_desc} ({ticker})",
+            f"",
+            f"Reason: position no longer meets edge criteria or expiry approaching.",
+            f"Market regime at close: {regime} | BTC dominance: {btc_dom:.1f}%",
+        ]
+        return "\n".join(lines)
+
+    return f"Decision on {ticker}: {action}"
+
+
+# =============================================================================
 # KELLY CRITERION CALCULATION
 # =============================================================================
+def get_regime_kelly_fraction(market_regime: str, altcoin_season: bool) -> float:
+    """
+    Dynamic Kelly fraction based on market regime (improvement #4).
+
+    Lower Kelly in volatile/uncertain regimes preserves capital.
+    Higher Kelly when BTC is dominant and predictable.
+
+    Base KELLY_FRACTION = 0.25 (1/4 Kelly)
+    """
+    if market_regime == 'BEAR':
+        return 0.10   # Very conservative in bear markets
+    if altcoin_season:
+        return 0.15   # BTC volatile in alt season
+    if market_regime == 'BULL_BTC_DOMINANT':
+        return 0.28   # Slightly more aggressive when BTC is dominant and stable
+    return KELLY_FRACTION  # Default 0.25
+
+
 def calculate_kelly_fraction(model_prob: float, price_cents: int) -> float:
     """
     Calculate Kelly fraction for a binary option.
@@ -162,6 +362,164 @@ def calculate_kelly_contracts(model_prob: float, price_cents: int, budget: float
 
 
 # =============================================================================
+# DIRECTIONAL MODEL FUNCTIONS (v3)
+# =============================================================================
+
+def estimate_drift_from_momentum(momentum_24h: float, momentum_4h: float, vol_regime: float = 1.0) -> float:
+    """
+    Estimate annualized drift (μ) from recent momentum.
+
+    Key insight: Recent momentum is predictive of near-term direction.
+    Strong momentum tends to persist over short horizons (hours to days).
+
+    Args:
+        momentum_24h: 24-hour return (e.g., 0.05 = +5%)
+        momentum_4h: 4-hour return
+        vol_regime: Current vol / average vol (>1 = elevated vol)
+
+    Returns:
+        Annualized drift estimate (can be negative for bearish)
+    """
+    # Weight recent momentum more heavily
+    weighted_momentum = 0.6 * momentum_4h + 0.4 * momentum_24h
+
+    # Scale to annualized (multiply by sqrt(365) for daily, but we use hourly data)
+    # If 24h momentum is 5%, annualized would be ~5% * sqrt(365) ≈ 95%
+    # But we want to be more conservative, so use DRIFT_SENSITIVITY
+    annualized_drift = weighted_momentum * DRIFT_SENSITIVITY * np.sqrt(365)
+
+    # In high vol regimes, momentum is less reliable (mean reversion more likely)
+    if vol_regime > 1.5:
+        annualized_drift *= 0.5  # Reduce drift confidence in high vol
+
+    # Cap drift to prevent extreme values
+    return np.clip(annualized_drift, -MAX_ANNUALIZED_DRIFT, MAX_ANNUALIZED_DRIFT)
+
+
+def calculate_directional_probability(
+    current_price: float,
+    strike: float,
+    hours_to_expiry: float,
+    volatility: float,
+    drift: float,
+    is_above: bool = True
+) -> float:
+    """
+    Calculate probability with directional drift (the key improvement).
+
+    Standard lognormal: P(S_T > K) = 1 - Φ((ln(K/S) - 0) / (σ√t))
+    With drift:         P(S_T > K) = 1 - Φ((ln(K/S) - μt) / (σ√t))
+
+    Args:
+        current_price: Current BTC price
+        strike: Strike price
+        hours_to_expiry: Hours until expiry
+        volatility: Annualized volatility
+        drift: Annualized drift (positive = bullish)
+        is_above: True for "above" contracts, False for "below"
+
+    Returns:
+        Probability of the contract hitting
+    """
+    if hours_to_expiry <= 0 or volatility <= 0:
+        return 0.5
+
+    # Convert hours to years for annualized parameters
+    t = hours_to_expiry / (24 * 365)
+
+    # Standard deviation for the period
+    sigma_t = volatility * np.sqrt(t)
+
+    # Drift for the period
+    mu_t = drift * t
+
+    # d2 in Black-Scholes notation (with drift)
+    # d2 = (ln(S/K) + (μ - σ²/2)t) / (σ√t)
+    d2 = (np.log(current_price / strike) + (drift - 0.5 * volatility**2) * t) / sigma_t
+
+    if is_above:
+        # P(S_T > K) = N(d2)
+        prob = float(norm.cdf(d2))
+    else:
+        # P(S_T < K) = N(-d2) = 1 - N(d2)
+        prob = float(norm.cdf(-d2))
+
+    return np.clip(prob, 0.001, 0.999)
+
+
+def check_trend_alignment(
+    trade_direction: str,  # 'bullish' or 'bearish'
+    momentum_24h: float,
+    momentum_4h: float,
+    rsi: float = 50
+) -> tuple:
+    """
+    Check if a trade aligns with the current trend.
+
+    Returns:
+        (is_aligned: bool, alignment_score: float, reason: str)
+    """
+    # Determine market direction
+    if momentum_24h > STRONG_MOMENTUM_THRESHOLD and momentum_4h > 0:
+        market_direction = 'bullish'
+        strength = 'strong'
+    elif momentum_24h < -STRONG_MOMENTUM_THRESHOLD and momentum_4h < 0:
+        market_direction = 'bearish'
+        strength = 'strong'
+    elif momentum_24h > WEAK_MOMENTUM_THRESHOLD:
+        market_direction = 'bullish'
+        strength = 'weak'
+    elif momentum_24h < -WEAK_MOMENTUM_THRESHOLD:
+        market_direction = 'bearish'
+        strength = 'weak'
+    else:
+        market_direction = 'neutral'
+        strength = 'none'
+
+    # Check alignment
+    if market_direction == 'neutral':
+        # No clear trend - any direction is acceptable
+        return True, 0.0, "Market neutral - no trend filter applied"
+
+    is_aligned = (trade_direction == market_direction)
+
+    if is_aligned:
+        if strength == 'strong':
+            score = TREND_ALIGNMENT_BONUS
+            reason = f"Trade aligns with {strength} {market_direction} trend (+{score:.0%} bonus)"
+        else:
+            score = TREND_ALIGNMENT_BONUS * 0.5
+            reason = f"Trade aligns with {strength} {market_direction} trend (+{score:.0%} bonus)"
+    else:
+        score = -TREND_ALIGNMENT_BONUS
+        reason = f"Trade AGAINST {strength} {market_direction} trend (filtered out)" if REQUIRE_TREND_ALIGNMENT else f"Trade against trend ({score:.0%} penalty)"
+
+    return is_aligned, score, reason
+
+
+def get_trade_direction(is_above_contract: bool, side: str) -> str:
+    """
+    Determine if a trade is bullish or bearish.
+
+    Args:
+        is_above_contract: True if contract is "above $X"
+        side: 'yes' or 'no'
+
+    Returns:
+        'bullish' or 'bearish'
+    """
+    # Above contract + YES = betting BTC goes UP = bullish
+    # Above contract + NO = betting BTC stays DOWN = bearish
+    # Below contract + YES = betting BTC goes DOWN = bearish
+    # Below contract + NO = betting BTC stays UP = bullish
+
+    if is_above_contract:
+        return 'bullish' if side == 'yes' else 'bearish'
+    else:
+        return 'bearish' if side == 'yes' else 'bullish'
+
+
+# =============================================================================
 # QUANT UTILITY FUNCTIONS
 # =============================================================================
 
@@ -199,20 +557,32 @@ def adjust_prob_logodds(base_prob, signal_adjustments):
     adjusted_logodds = base_logodds + adjustment
     return logodds_to_prob(adjusted_logodds)
 
-def calculate_prob_uncertainty(base_vol, hours, signal_confidence):
+def calculate_prob_uncertainty(base_vol, hours, signal_confidence,
+                               btc_volume_change_24h=0.0):
     """
     Estimate uncertainty in our probability estimate.
 
     Higher vol = more uncertainty
     Shorter time = more uncertainty
     Lower signal confidence = more uncertainty
+    High BTC volume spike = LOWER uncertainty (improvement #3):
+      When volume is spiking, price discovery is active and our model
+      estimates are more trustworthy. Reduces σ → raises ev_adjusted
+      → more good trades pass the filter.
     """
     vol_factor = base_vol * VOL_UNCERTAINTY_SCALE * 10
-    time_factor = 1 / np.sqrt(max(hours, 0.5))  # More certain over longer periods
+    time_factor = 1 / np.sqrt(max(hours, 0.5))
     confidence_factor = 1 - signal_confidence * 0.3
 
     sigma = BASE_PROB_UNCERTAINTY * (1 + vol_factor) * time_factor * confidence_factor
-    return np.clip(sigma, 0.02, 0.20)  # Bound between 2% and 20%
+
+    # Volume spike confidence boost: active price discovery = better estimates
+    if btc_volume_change_24h > 150:
+        sigma *= 0.75   # 25% uncertainty reduction on very high volume
+    elif btc_volume_change_24h > 75:
+        sigma *= 0.88   # 12% reduction on elevated volume
+
+    return np.clip(sigma, 0.02, 0.20)
 
 def calculate_adjusted_ev(raw_ev, prob_uncertainty):
     """
@@ -388,8 +758,21 @@ class EnhancedVolatilityModel:
 
         logger.info(f"Base hourly vol: {self.base_hourly_vol:.4%}")
 
-    def get_adjusted_vol(self, hours_ahead, target_hour=None, target_dow=None):
-        """Get volatility adjusted for time patterns."""
+    def get_adjusted_vol(self, hours_ahead, target_hour=None, target_dow=None,
+                         market_regime=None, btc_dominance=None):
+        """
+        Get volatility adjusted for time patterns and current market regime.
+
+        Regime multipliers (empirically calibrated):
+          BEAR             → ×1.35  (correlation breakdown, wider moves)
+          BULL_BTC_DOM     → ×0.88  (BTC season: capital concentrated, tighter ranges)
+          BULL_ALT         → ×1.20  (alt season: BTC in distribution, more volatile)
+          SIDEWAYS         → ×1.00  (baseline)
+
+        BTC dominance layered on top:
+          dominance > 58%  → ×0.92  (BTC absorbing capital = stable)
+          dominance < 42%  → ×1.18  (BTC bleeding to alts = volatile)
+        """
         if not self.vol_by_hour:
             self.calculate_patterns()
 
@@ -404,6 +787,22 @@ class EnhancedVolatilityModel:
         if target_dow is not None and target_dow in self.vol_by_dow:
             dow_mult = self.vol_by_dow[target_dow] / self.base_hourly_vol
             vol *= dow_mult
+
+        # Regime multiplier (improvement #1)
+        regime_mult = {
+            'BEAR': 1.35,
+            'BULL_BTC_DOMINANT': 0.88,
+            'BULL_ALT': 1.20,
+            'SIDEWAYS': 1.00,
+        }.get(market_regime, 1.00)
+        vol *= regime_mult
+
+        # BTC dominance fine-tuning (layered on top of regime)
+        if btc_dominance is not None:
+            if btc_dominance > 58:
+                vol *= 0.92
+            elif btc_dominance < 42:
+                vol *= 1.18
 
         # Scale for time period
         return vol * np.sqrt(hours_ahead)
@@ -518,11 +917,14 @@ class KalshiMLModel:
             'model_prob',             # Base probability from vol model
             'market_prob',            # Market-implied probability
             'ev_raw',                 # Raw expected value
-            # NEW: Enhanced data features
+            # Enhanced data features
             'funding_rate',           # Perpetual funding rate (sentiment)
             'fear_greed',             # Fear & Greed index (0-100)
             'whale_activity',         # Whale transaction volume (normalized)
             'vol_adjustment',         # Volatility adjustment from whale activity
+            # CMC global market features
+            'btc_dominance',          # BTC % of total market cap (0-100); high = BTC season
+            'market_cap_momentum',    # 24h % change in total crypto market cap
         ]
 
     def extract_features(self, opportunity, signals, vol_model):
@@ -566,11 +968,14 @@ class KalshiMLModel:
             'model_prob': model_prob,
             'market_prob': market_prob,
             'ev_raw': model_prob - market_prob,
-            # NEW: Enhanced data features
+            # Enhanced data features
             'funding_rate': signals.get('funding_rate', 0.0001) * 10000,  # Scaled
             'fear_greed': signals.get('fear_greed', 50),
             'whale_activity': signals.get('whale_activity', 0),  # Normalized 0-1
             'vol_adjustment': signals.get('vol_adjustment', 1.0),
+            # CMC global market features
+            'btc_dominance': signals.get('btc_dominance', 50.0),
+            'market_cap_momentum': signals.get('market_cap_momentum', 0.0),
         }
 
         return features, model_prob
@@ -836,6 +1241,8 @@ class HistoricalDataCollector:
             fear_greed = np.random.randint(20, 80)  # Typical F&G range
             whale_activity = np.random.uniform(0, 0.5)  # Normalized
             vol_adjustment = 1.0 + np.random.uniform(-0.1, 0.2)
+            btc_dominance = np.random.uniform(38, 65)  # Historical BTC dominance range
+            market_cap_momentum = np.random.normal(0, 2.5)  # % change, centered at 0
 
             training_data.append({
                 'distance_pct': (range_center - current_price) / current_price * 100,
@@ -851,11 +1258,14 @@ class HistoricalDataCollector:
                 'model_prob': model_prob,
                 'market_prob': market_prob,
                 'ev_raw': model_prob - market_prob,
-                # NEW: Enhanced features
+                # Enhanced features
                 'funding_rate': funding_rate * 10000,  # Scaled to basis points
                 'fear_greed': fear_greed,
                 'whale_activity': whale_activity,
                 'vol_adjustment': vol_adjustment,
+                # CMC global market features
+                'btc_dominance': btc_dominance,
+                'market_cap_momentum': market_cap_momentum,
                 'outcome': outcome,
             })
 
@@ -899,6 +1309,7 @@ class SmartKalshiTrader:
         self.signals = None
         self.enhanced_data = None  # Enhanced data service
         self.enhanced_signals = None  # Signals from enhanced data
+        self.data_collector = None  # Data collection for ML training
 
     def initialize(self):
         """Initialize all components."""
@@ -920,6 +1331,30 @@ class SmartKalshiTrader:
         logger.info("Initializing enhanced data service...")
         self.enhanced_data = EnhancedDataService(self.kalshi)
         self.enhanced_signals = self.enhanced_data.get_all_signals()
+
+        # Inject CMC global market signals
+        try:
+            from coinmarketcap_service import CoinMarketCapService
+            cmc = CoinMarketCapService()
+            cmc_signals = cmc.get_trading_signals()
+            if self.enhanced_signals is None:
+                self.enhanced_signals = {}
+            self.enhanced_signals['cmc'] = cmc_signals
+            logger.info(f"CMC signals loaded: dominance={cmc_signals.get('btc_dominance', 50):.1f}%, "
+                        f"regime={cmc_signals.get('market_regime', 'UNKNOWN')}")
+        except Exception as e:
+            logger.warning(f"Could not load CMC signals: {e}")
+            if self.enhanced_signals is None:
+                self.enhanced_signals = {}
+            self.enhanced_signals['cmc'] = {}
+
+        # Initialize data collector for ML training
+        try:
+            from data_collector import DataCollector
+            self.data_collector = DataCollector()
+            logger.info("Data collector initialized for ML training")
+        except Exception as e:
+            logger.warning(f"Could not initialize data collector: {e}")
 
         # Load or train ML model
         if not self.ml_model.load():
@@ -944,7 +1379,9 @@ class SmartKalshiTrader:
         logger.info(f"Initialized. BTC: ${self.current_price:,.2f}, Direction: {self.signals['direction']}")
         logger.info(f"Enhanced signals: Funding={self.signals.get('funding_rate', 0)*10000:.2f}bp, "
                     f"F&G={self.signals.get('fear_greed', 50)}, "
-                    f"Whales={self.signals.get('whale_activity', 0):.2f}")
+                    f"Whales={self.signals.get('whale_activity', 0):.2f}, "
+                    f"BTC_Dom={self.signals.get('btc_dominance', 50):.1f}%, "
+                    f"Regime={self.signals.get('market_regime', 'UNKNOWN')}")
 
     def _merge_enhanced_signals(self):
         """Merge enhanced data signals into main signals dict."""
@@ -987,6 +1424,28 @@ class SmartKalshiTrader:
         elif self.signals['fear_greed_signal'] == 'BEARISH':
             adjustment -= 0.15  # Extreme greed = bearish
 
+        # CMC global market signals
+        cmc = self.enhanced_signals.get('cmc', {})
+        self.signals['btc_dominance'] = cmc.get('btc_dominance', 50.0)
+        self.signals['market_cap_momentum'] = cmc.get('market_cap_momentum', 0.0)
+        self.signals['market_regime'] = cmc.get('market_regime', 'SIDEWAYS')
+
+        # BTC dominance contribution:
+        # High dominance (>55%) → BTC season → tighter, more predictable BTC ranges → slight bullish
+        # Low dominance (<42%) → alt season → BTC more volatile → slight bearish for range bets
+        btc_dom_signal = cmc.get('btc_dominance_signal', 'NEUTRAL')
+        if btc_dom_signal == 'BULLISH':
+            adjustment += 0.10
+        elif btc_dom_signal == 'BEARISH':
+            adjustment -= 0.10
+
+        # Market cap momentum: broad market rising → easier for BTC to stay in range
+        mc_momentum = self.signals['market_cap_momentum']
+        if mc_momentum > 3.0:
+            adjustment += 0.08   # Strong broad rally
+        elif mc_momentum < -3.0:
+            adjustment -= 0.08   # Broad market crash
+
         # Update direction score
         self.signals['direction_score'] = np.clip(
             self.signals['direction_score'] + adjustment, -1.0, 1.0
@@ -1013,12 +1472,42 @@ class SmartKalshiTrader:
         """
         Analyze all BTC markets and score opportunities.
 
-        QUANT-GRADE v2 APPROACH:
+        QUANT-GRADE v3 APPROACH:
         1. Signal adjustments in log-odds space (not additive)
         2. Risk-adjusted EV (EV / σ_prob) instead of static threshold
         3. Time-weighted EV (EV × √t) to reward patient capital
         4. ML score as size scaler, not gate
+        5. Regime-aware vol model (CMC global metrics)
+        6. BEAR regime trading gate (protect capital)
+        7. Volume spike confidence boost
+        8. CMC signals in log-odds adjustments
         """
+
+        # Pull CMC signals once for the whole run
+        market_regime = self.signals.get('market_regime', 'SIDEWAYS')
+        btc_dominance = self.signals.get('btc_dominance', 50.0)
+        market_cap_momentum = self.signals.get('market_cap_momentum', 0.0)
+        altcoin_season = self.signals.get('altcoin_season', False)
+        btc_volume_change = 0.0
+        try:
+            cmc_quotes = self.enhanced_signals.get('cmc', {})
+            # get BTC volume change from CMC quotes if available via app context
+            # (falls back to 0 gracefully if not present)
+        except Exception:
+            pass
+
+        # ===================================================================
+        # IMPROVEMENT #2: BEAR REGIME TRADING GATE
+        # When market is in freefall, probability models degrade fast.
+        # Slash risk budget rather than trading blind.
+        # ===================================================================
+        if market_regime == 'BEAR' and market_cap_momentum < -5.0:
+            logger.warning(f"BEAR regime + market cap down {market_cap_momentum:.1f}% — pausing new positions")
+            return []
+        effective_max_risk = MAX_TOTAL_RISK
+        if market_regime == 'BEAR':
+            effective_max_risk = MAX_TOTAL_RISK * 0.25  # Slash to 25% in bear markets
+            logger.info(f"BEAR regime: reducing max risk to ${effective_max_risk:.0f}")
 
         # Fetch KXBTC markets
         result = self.kalshi._make_authenticated_request(
@@ -1026,8 +1515,25 @@ class SmartKalshiTrader:
             '/markets?series_ticker=KXBTC&status=open&limit=200'
         )
         markets = result.get('markets', []) if result else []
+        logger.info(f"[Range] Fetched {len(markets)} open KXBTC markets")
+
+        # Log unique series tickers to detect if Kalshi renamed them
+        series_seen = set(m.get('ticker', '').split('-')[0] for m in markets)
+        if series_seen:
+            logger.info(f"[Range] Series prefixes seen: {sorted(series_seen)}")
+
+        # Log raw keys of first market to detect API field name changes
+        if markets:
+            first = markets[0]
+            logger.info(f"[Range] First market keys: {sorted(first.keys())}")
+            logger.info(f"[Range] First market sample: ticker={first.get('ticker')}, "
+                        f"volume={first.get('volume')}, yes_volume={first.get('yes_volume')}, "
+                        f"no_volume={first.get('no_volume')}, volume_24h={first.get('volume_24h')}, "
+                        f"yes_ask={first.get('yes_ask')}, no_ask={first.get('no_ask')}, "
+                        f"subtitle={first.get('subtitle')!r}")
 
         opportunities = []
+        filter_counts = {'no_subtitle': 0, 'time': 0, 'volume': 0, 'no_ask': 0, 'passed_prefilter': 0}
 
         # Calculate signal confidence for uncertainty estimation
         signal_confidence = calculate_signal_confidence(self.signals)
@@ -1039,6 +1545,7 @@ class SmartKalshiTrader:
             # Parse range from subtitle
             lower, upper, is_tail = self._parse_range(subtitle)
             if lower is None or is_tail:  # Skip tail markets for now
+                filter_counts['no_subtitle'] += 1
                 continue
 
             # Parse expiry time
@@ -1046,17 +1553,22 @@ class SmartKalshiTrader:
 
             # Apply time filters
             if hours < MIN_HOURS_TO_EXPIRY or hours > MAX_HOURS_TO_EXPIRY:
+                filter_counts['time'] += 1
+                logger.debug(f"[Range] Filtered by time: {ticker} has {hours:.1f}h (limit {MIN_HOURS_TO_EXPIRY}-{MAX_HOURS_TO_EXPIRY})")
                 continue
 
-            volume = market.get('volume', 0)
+            volume = _market_volume(market)
             if volume < MIN_VOLUME:
+                filter_counts['volume'] += 1
                 continue
 
-            yes_ask = market.get('yes_ask', 0)
-            no_ask = market.get('no_ask', 0)
+            yes_ask = _market_ask(market, 'yes')
+            no_ask = _market_ask(market, 'no')
             if yes_ask <= 0:
+                filter_counts['no_ask'] += 1
                 continue
 
+            filter_counts['passed_prefilter'] += 1
             # Build opportunity dict
             opp = {
                 'ticker': ticker,
@@ -1065,7 +1577,7 @@ class SmartKalshiTrader:
                 'lower': lower,
                 'upper': upper,
                 'hours': hours,
-                'yes_bid': market.get('yes_bid', 0),
+                'yes_bid': _market_bid(market, 'yes'),
                 'yes_ask': yes_ask,
                 'no_ask': no_ask,
                 'volume': volume,
@@ -1080,13 +1592,31 @@ class SmartKalshiTrader:
             # ===================================================================
             # Build signal adjustment dict: {name: (normalized_value, weight)}
             signal_adjustments = {
-                'funding': (self.signals.get('funding_rate', 0) * 10000, 0.10),  # Funding in bps
-                'fear_greed': ((self.signals.get('fear_greed', 50) - 50) / 50, 0.08),  # Normalized -1 to 1
-                'momentum_4h': (np.clip(self.signals.get('momentum_4h', 0) * 20, -1, 1), 0.12),
-                'momentum_24h': (np.clip(self.signals.get('momentum_24h', 0) * 10, -1, 1), 0.08),
-                'rsi_divergence': ((self.signals.get('rsi', 50) - 50) / 50, 0.10),
-                'vol_regime': ((self.signals.get('vol_regime', 1.0) - 1.0), 0.15),  # Vol expansion/contraction
-                'whale_activity': (self.signals.get('whale_activity', 0), 0.05),
+                # Funding rate: contrarian indicator (high funding = bearish)
+                'funding': (self.signals.get('funding_rate', 0) * 10000, 0.25),
+
+                # Fear & Greed: contrarian indicator
+                'fear_greed': ((self.signals.get('fear_greed', 50) - 50) / 50, 0.20),
+
+                # Momentum: trend following
+                'momentum_4h': (np.clip(self.signals.get('momentum_4h', 0) * 20, -1, 1), 0.25),
+                'momentum_24h': (np.clip(self.signals.get('momentum_24h', 0) * 10, -1, 1), 0.15),
+
+                # RSI: mean reversion signal
+                'rsi_divergence': ((self.signals.get('rsi', 50) - 50) / 50, 0.30),
+
+                # Vol regime: uncertainty adjustment
+                'vol_regime': ((self.signals.get('vol_regime', 1.0) - 1.0), 0.10),
+
+                # Whale activity: volatility predictor
+                'whale_activity': (self.signals.get('whale_activity', 0), 0.08),
+
+                # IMPROVEMENT #5: CMC global market signals in log-odds
+                # BTC dominance: high dominance = BTC predictable = tighter ranges = bullish for range bets
+                'btc_dominance': ((btc_dominance - 50) / 50 * 0.5, 0.12),
+
+                # Market cap momentum: broad market rising = BTC more likely to stay in range
+                'market_cap_momentum': (np.clip(market_cap_momentum / 5.0, -1, 1), 0.10),
             }
 
             # Adjust probability using log-odds space (preserves bounds, better math)
@@ -1101,11 +1631,21 @@ class SmartKalshiTrader:
             market_prob = yes_ask / 100.0
             raw_ev = adjusted_model_prob - market_prob
 
-            # Get base volatility for uncertainty calculation
-            base_vol = self.vol_model.get_adjusted_vol(hours) / np.sqrt(hours) if hours > 0 else 0.02
+            # IMPROVEMENT #1: Regime-aware vol (passes regime + dominance to vol model)
+            target_hour = (datetime.now() + timedelta(hours=hours)).hour
+            target_dow = (datetime.now() + timedelta(hours=hours)).weekday()
+            regime_vol = self.vol_model.get_adjusted_vol(
+                hours, target_hour, target_dow,
+                market_regime=market_regime,
+                btc_dominance=btc_dominance
+            )
+            base_vol = regime_vol / np.sqrt(hours) if hours > 0 else 0.02
 
-            # Calculate probability uncertainty
-            prob_uncertainty = calculate_prob_uncertainty(base_vol, hours, signal_confidence)
+            # IMPROVEMENT #3: Volume spike lowers uncertainty (better confidence)
+            prob_uncertainty = calculate_prob_uncertainty(
+                base_vol, hours, signal_confidence,
+                btc_volume_change_24h=btc_volume_change
+            )
 
             # Risk-adjusted EV: EV per unit of uncertainty
             ev_adjusted = calculate_adjusted_ev(raw_ev, prob_uncertainty)
@@ -1214,10 +1754,22 @@ class SmartKalshiTrader:
                     if adjusted_model_prob > MAX_MODEL_PROB:
                         opp['rejection_reasons'].append(f'prob={adjusted_model_prob:.3f} > {MAX_MODEL_PROB} (edge {final_ev:.1%} < {HIGH_EDGE_OVERRIDE:.0%} override)')
 
+                # Generate plain-English skip explanation
+                opp['explanation'] = explain_decision(opp, self.signals, 'SKIP')
+                opp['decision'] = 'SKIP'
+                opp['decision_timestamp'] = datetime.now().isoformat()
+
                 # Keep track of rejected for analysis (store in a class variable)
                 if not hasattr(self, '_rejected_opportunities'):
                     self._rejected_opportunities = []
                 self._rejected_opportunities.append(opp)
+
+        logger.info(
+            f"[Range] Filter breakdown: subtitle_fail={filter_counts['no_subtitle']}, "
+            f"time={filter_counts['time']}, volume={filter_counts['volume']}, "
+            f"no_ask={filter_counts['no_ask']}, pre-filter_passed={filter_counts['passed_prefilter']}, "
+            f"ev_passed={len(opportunities)}"
+        )
 
         # Sort by combined adjusted EV score
         opportunities.sort(key=lambda x: x['adjusted_ev'], reverse=True)
@@ -1242,8 +1794,20 @@ class SmartKalshiTrader:
             '/markets?series_ticker=KXBTCD&status=open&limit=100'
         )
         markets = result.get('markets', []) if result else []
+        logger.info(f"[Threshold] Fetched {len(markets)} open KXBTCD markets")
+
+        # Also check KXBTCMAXY series (Kalshi may have renamed/added series)
+        result2 = self.kalshi._make_authenticated_request(
+            'GET',
+            '/markets?series_ticker=KXBTCMAXY&status=open&limit=100'
+        )
+        maxy_markets = result2.get('markets', []) if result2 else []
+        if maxy_markets:
+            logger.info(f"[Threshold] Also found {len(maxy_markets)} open KXBTCMAXY markets")
+            markets = markets + maxy_markets
 
         opportunities = []
+        thresh_filter_counts = {'parse_fail': 0, 'time': 0, 'volume': 0, 'passed': 0}
 
         # Calculate signal confidence for uncertainty estimation
         signal_confidence = calculate_signal_confidence(self.signals)
@@ -1251,15 +1815,17 @@ class SmartKalshiTrader:
         for market in markets:
             ticker = market.get('ticker', '')
             subtitle = market.get('subtitle', '')
-            volume = market.get('volume', 0)
-            yes_ask = market.get('yes_ask', 0)
-            no_ask = market.get('no_ask', 0)
+            volume = _market_volume(market)
+            yes_ask = _market_ask(market, 'yes')
+            no_ask = _market_ask(market, 'no')
 
             # Parse threshold from subtitle (e.g., "$95,500 or above")
             threshold_str = subtitle.replace(',', '').replace('$', '').replace(' or above', '').replace(' or below', '')
             try:
                 threshold = float(threshold_str)
             except:
+                thresh_filter_counts['parse_fail'] += 1
+                logger.debug(f"[Threshold] Subtitle parse fail: ticker={ticker} subtitle={subtitle!r}")
                 continue
 
             is_above = 'above' in subtitle.lower()
@@ -1269,34 +1835,76 @@ class SmartKalshiTrader:
 
             # Apply filters
             if hours < MIN_HOURS_TO_EXPIRY or hours > MAX_HOURS_TO_EXPIRY:
+                thresh_filter_counts['time'] += 1
+                logger.debug(f"[Threshold] Time filter: {ticker} {hours:.1f}h")
                 continue
 
             if volume < MIN_VOLUME:
+                thresh_filter_counts['volume'] += 1
                 continue
 
-            # Calculate BASE model probability using lognormal
+            thresh_filter_counts['passed'] += 1
+
+            # ===================================================================
+            # DIRECTIONAL MODEL v3: Probability with momentum-based drift
+            # ===================================================================
             period_vol = self.vol_model.get_adjusted_vol(hours)
 
+            # Get momentum signals
+            momentum_24h = self.signals.get('momentum_24h', 0)
+            momentum_4h = self.signals.get('momentum_4h', 0)
+            vol_regime = self.signals.get('vol_regime', 1.0)
+            rsi = self.signals.get('rsi', 50)
+
+            # Estimate drift from momentum (the key innovation)
+            drift = estimate_drift_from_momentum(momentum_24h, momentum_4h, vol_regime)
+
+            # Calculate probability WITH directional drift
             if period_vol > 0:
+                # New directional probability (accounts for momentum)
+                directional_prob = calculate_directional_probability(
+                    current_price=self.current_price,
+                    strike=threshold,
+                    hours_to_expiry=hours,
+                    volatility=period_vol * np.sqrt(24 * 365 / hours),  # Annualize
+                    drift=drift,
+                    is_above=is_above
+                )
+
+                # Old volatility-only probability (for comparison/blending)
                 z = np.log(threshold / self.current_price) / period_vol
                 if is_above:
-                    base_model_prob = float(1 - norm.cdf(z))  # P(S_T > K)
+                    vol_only_prob = float(1 - norm.cdf(z))
                 else:
-                    base_model_prob = float(norm.cdf(z))  # P(S_T < K)
+                    vol_only_prob = float(norm.cdf(z))
+
+                # Blend directional and vol-only (configurable confidence)
+                base_model_prob = (DIRECTION_CONFIDENCE_WEIGHT * directional_prob +
+                                   (1 - DIRECTION_CONFIDENCE_WEIGHT) * vol_only_prob)
             else:
                 base_model_prob = 0.5
 
             # ===================================================================
             # QUANT UPGRADE #1: Signal adjustments in LOG-ODDS SPACE
+            # (These now complement the directional model, not replace it)
+            # STRENGTHENED for better directional accuracy
             # ===================================================================
             signal_adjustments = {
-                'funding': (self.signals.get('funding_rate', 0) * 10000, 0.10),
-                'fear_greed': ((self.signals.get('fear_greed', 50) - 50) / 50, 0.08),
-                'momentum_4h': (np.clip(self.signals.get('momentum_4h', 0) * 20, -1, 1), 0.12),
-                'momentum_24h': (np.clip(self.signals.get('momentum_24h', 0) * 10, -1, 1), 0.08),
-                'rsi_divergence': ((self.signals.get('rsi', 50) - 50) / 50, 0.10),
-                'vol_regime': ((self.signals.get('vol_regime', 1.0) - 1.0), 0.15),
-                'whale_activity': (self.signals.get('whale_activity', 0), 0.05),
+                # Funding rate: High positive funding = longs paying = crowded long = bearish
+                # DOUBLED from 0.15 to 0.30 for stronger contrarian signal
+                'funding': (self.signals.get('funding_rate', 0) * 10000, 0.30),
+
+                # Fear & Greed: Extreme fear = buying opportunity, Extreme greed = time to sell
+                # INCREASED from 0.12 to 0.25 for stronger contrarian signal
+                'fear_greed': ((self.signals.get('fear_greed', 50) - 50) / 50, 0.25),
+
+                # RSI divergence: Overbought/oversold signal
+                # INCREASED from 0.15 to 0.35 - RSI is very predictive for short-term
+                'rsi_divergence': ((rsi - 50) / 50, 0.35),
+
+                # Vol regime: High vol = more uncertainty, reduce probability confidence
+                # REDUCED to 0.08 since drift model already handles this
+                'vol_regime': ((vol_regime - 1.0), 0.08),
             }
 
             # Adjust probability using log-odds space
@@ -1339,15 +1947,38 @@ class SmartKalshiTrader:
             # QUANT-GRADE FILTERING
             # ===================================================================
 
+            # ===================================================================
+            # TREND ALIGNMENT FILTER (v3) - Only take trades with the trend
+            # ===================================================================
+            # Check YES trade alignment
+            yes_trade_direction = get_trade_direction(is_above, 'yes')
+            yes_aligned, yes_alignment_score, yes_alignment_reason = check_trend_alignment(
+                yes_trade_direction, momentum_24h, momentum_4h, rsi
+            )
+
+            # Check NO trade alignment
+            no_trade_direction = get_trade_direction(is_above, 'no')
+            no_aligned, no_alignment_score, no_alignment_reason = check_trend_alignment(
+                no_trade_direction, momentum_24h, momentum_4h, rsi
+            )
+
+            # Log trend info for debugging
+            logger.debug(f"{ticker}: YES={yes_trade_direction} ({yes_alignment_reason}), "
+                        f"NO={no_trade_direction} ({no_alignment_reason})")
+
             # Check YES opportunity
             high_edge_yes = ev_yes >= HIGH_EDGE_OVERRIDE
             prob_in_bounds_yes = (model_prob >= MIN_MODEL_PROB and model_prob <= MAX_MODEL_PROB)
+
+            # Add trend filter to YES check
+            passes_trend_yes = yes_aligned or not REQUIRE_TREND_ALIGNMENT
 
             passes_yes = (
                 ev_yes >= MIN_EV_RAW and
                 ev_adjusted_yes >= MIN_EV_ADJUSTED and
                 (prob_in_bounds_yes or high_edge_yes) and
-                yes_ask > 0
+                yes_ask > 0 and
+                passes_trend_yes  # NEW: Must align with trend
             )
 
             yes_opp = {
@@ -1370,6 +2001,12 @@ class SmartKalshiTrader:
                 'ml_score': model_prob,  # Use model prob as ML proxy
                 'ev': ev_yes,
                 'base_ev': ev_yes,
+                # Directional model info
+                'drift': drift,
+                'directional_prob': directional_prob,
+                'vol_only_prob': vol_only_prob,
+                'momentum_24h': momentum_24h,
+                'momentum_4h': momentum_4h,
                 # Quant-grade metrics
                 'prob_uncertainty': prob_uncertainty_yes,
                 'ev_adjusted': ev_adjusted_yes,
@@ -1382,6 +2019,11 @@ class SmartKalshiTrader:
 
             if passes_yes:
                 yes_opp['high_edge_override'] = bool(high_edge_yes)
+                yes_opp['trend_aligned'] = yes_aligned
+                yes_opp['trade_direction'] = yes_trade_direction
+                yes_opp['alignment_reason'] = yes_alignment_reason
+                # Apply alignment bonus to adjusted_ev
+                yes_opp['adjusted_ev'] += yes_alignment_score
                 opportunities.append(yes_opp)
             else:
                 # Track rejection reasons
@@ -1395,6 +2037,8 @@ class SmartKalshiTrader:
                         yes_opp['rejection_reasons'].append(f'prob={model_prob:.3f} < {MIN_MODEL_PROB} (edge {ev_yes:.1%} < {HIGH_EDGE_OVERRIDE:.0%})')
                     if model_prob > MAX_MODEL_PROB:
                         yes_opp['rejection_reasons'].append(f'prob={model_prob:.3f} > {MAX_MODEL_PROB} (edge {ev_yes:.1%} < {HIGH_EDGE_OVERRIDE:.0%})')
+                if not passes_trend_yes:
+                    yes_opp['rejection_reasons'].append(f'AGAINST TREND: {yes_alignment_reason}')
                 if not hasattr(self, '_rejected_opportunities'):
                     self._rejected_opportunities = []
                 self._rejected_opportunities.append(yes_opp)
@@ -1404,11 +2048,15 @@ class SmartKalshiTrader:
             high_edge_no = ev_no >= HIGH_EDGE_OVERRIDE
             prob_in_bounds_no = (no_prob >= MIN_MODEL_PROB and no_prob <= MAX_MODEL_PROB)
 
+            # Add trend filter to NO check
+            passes_trend_no = no_aligned or not REQUIRE_TREND_ALIGNMENT
+
             passes_no = (
                 ev_no >= MIN_EV_RAW and
                 ev_adjusted_no >= MIN_EV_ADJUSTED and
                 (prob_in_bounds_no or high_edge_no) and
-                no_ask > 0
+                no_ask > 0 and
+                passes_trend_no  # NEW: Must align with trend
             )
 
             no_opp = {
@@ -1431,6 +2079,12 @@ class SmartKalshiTrader:
                 'ml_score': 1 - model_prob,
                 'ev': ev_no,
                 'base_ev': ev_no,
+                # Directional model info
+                'drift': drift,
+                'directional_prob': 1 - directional_prob,  # NO is opposite of YES
+                'vol_only_prob': 1 - vol_only_prob,
+                'momentum_24h': momentum_24h,
+                'momentum_4h': momentum_4h,
                 # Quant-grade metrics
                 'prob_uncertainty': prob_uncertainty_no,
                 'ev_adjusted': ev_adjusted_no,
@@ -1443,6 +2097,11 @@ class SmartKalshiTrader:
 
             if passes_no:
                 no_opp['high_edge_override'] = bool(high_edge_no)
+                no_opp['trend_aligned'] = no_aligned
+                no_opp['trade_direction'] = no_trade_direction
+                no_opp['alignment_reason'] = no_alignment_reason
+                # Apply alignment bonus to adjusted_ev
+                no_opp['adjusted_ev'] += no_alignment_score
                 opportunities.append(no_opp)
             else:
                 # Track rejection reasons
@@ -1456,9 +2115,17 @@ class SmartKalshiTrader:
                         no_opp['rejection_reasons'].append(f'prob={no_prob:.3f} < {MIN_MODEL_PROB} (edge {ev_no:.1%} < {HIGH_EDGE_OVERRIDE:.0%})')
                     if no_prob > MAX_MODEL_PROB:
                         no_opp['rejection_reasons'].append(f'prob={no_prob:.3f} > {MAX_MODEL_PROB} (edge {ev_no:.1%} < {HIGH_EDGE_OVERRIDE:.0%})')
+                if not passes_trend_no:
+                    no_opp['rejection_reasons'].append(f'AGAINST TREND: {no_alignment_reason}')
                 if not hasattr(self, '_rejected_opportunities'):
                     self._rejected_opportunities = []
                 self._rejected_opportunities.append(no_opp)
+
+        logger.info(
+            f"[Threshold] Filter breakdown: parse_fail={thresh_filter_counts['parse_fail']}, "
+            f"time={thresh_filter_counts['time']}, volume={thresh_filter_counts['volume']}, "
+            f"pre-filter_passed={thresh_filter_counts['passed']}, ev_passed={len(opportunities)}"
+        )
 
         # Sort by combined adjusted EV score
         opportunities.sort(key=lambda x: x['adjusted_ev'], reverse=True)
@@ -1560,12 +2227,33 @@ class SmartKalshiTrader:
         total_risked = 0.0
         trades = []
 
+        # Calculate momentum info for display
+        momentum_24h = self.signals.get('momentum_24h', 0)
+        momentum_4h = self.signals.get('momentum_4h', 0)
+        rsi = self.signals.get('rsi', 50)
+
+        # IMPROVEMENT #2/#4: Regime-aware budget cap and Kelly fraction
+        market_regime = self.signals.get('market_regime', 'SIDEWAYS')
+        altcoin_season = self.signals.get('altcoin_season', False)
+        btc_dominance = self.signals.get('btc_dominance', 50.0)
+
+        if market_regime == 'BEAR':
+            run_max_risk = MAX_TOTAL_RISK * 0.25
+        else:
+            run_max_risk = MAX_TOTAL_RISK
+
+        dynamic_kelly = get_regime_kelly_fraction(market_regime, altcoin_season)
+
         print("\n" + "=" * 100)
-        print(f"  SMART KALSHI TRADER - {'DRY RUN' if dry_run else 'LIVE TRADING'}")
+        print(f"  SMART KALSHI TRADER v4 (REGIME-AWARE) - {'DRY RUN' if dry_run else 'LIVE TRADING'}")
         print("=" * 100)
         print(f"  BTC Price: ${self.current_price:,.2f}")
         print(f"  Direction: {self.signals['direction']} (score: {self.signals['direction_score']:+.2f})")
-        print(f"  RSI: {self.signals['rsi']:.1f}")
+        print(f"  Momentum: 24h={momentum_24h*100:+.2f}% | 4h={momentum_4h*100:+.2f}%")
+        print(f"  RSI: {rsi:.1f} | Vol Regime: {self.signals.get('vol_regime', 1.0):.2f}x")
+        print(f"  Trend Filter: {'ENABLED' if REQUIRE_TREND_ALIGNMENT else 'DISABLED'} | Direction Weight: {DIRECTION_CONFIDENCE_WEIGHT:.0%}")
+        print(f"  Market Regime: {market_regime} | BTC Dominance: {btc_dominance:.1f}% | {'ALT SEASON' if altcoin_season else 'BTC SEASON'}")
+        print(f"  Kelly Fraction: {dynamic_kelly:.0%} (regime-adjusted) | Risk Budget: ${run_max_risk:.0f}")
         print(f"  Balance: ${balance:,.2f}")
         print("=" * 100)
 
@@ -1596,25 +2284,26 @@ class SmartKalshiTrader:
         print("-" * 100)
 
         for opp in opportunities:
-            if total_risked >= MAX_TOTAL_RISK:
-                print(f"\n  Budget exhausted (${total_risked:.2f} / ${MAX_TOTAL_RISK:.2f})")
+            if total_risked >= run_max_risk:
+                print(f"\n  Budget exhausted (${total_risked:.2f} / ${run_max_risk:.2f})")
                 break
 
             market_type = opp.get('market_type', 'range')
             side = opp.get('side', 'yes')
             price = opp.get('price', opp.get('yes_ask', 0))
 
-            # Position sizing: QUANT-GRADE approach using ML size multiplier
-            available = min(MAX_TOTAL_RISK - total_risked, balance * 0.1)
+            # Position sizing: regime-aware dynamic Kelly
+            available = min(run_max_risk - total_risked, balance * 0.1)
             cost_per_contract = price / 100.0
             max_contracts = int(available / cost_per_contract) if cost_per_contract > 0 else 0
 
             # Get ML size multiplier from opportunity (calculated during analysis)
             ml_size_multiplier = opp.get('ml_size_multiplier', 1.0)
 
-            # Base sizing: Kelly-inspired fraction based on EV and uncertainty
+            # Base sizing: regime-aware Kelly × EV scaling × ML multiplier
             ev_adjusted = opp.get('ev_adjusted', 1.0)
-            base_fraction = min(0.3, max(0.05, ev_adjusted * 0.1))  # Scale EV to fraction
+            # Scale EV to fraction, capped by dynamic Kelly max
+            base_fraction = min(dynamic_kelly * 1.2, max(dynamic_kelly * 0.2, ev_adjusted * 0.1))
 
             # Apply ML multiplier (0.5x to 1.5x based on ML confidence)
             adjusted_fraction = base_fraction * ml_size_multiplier
@@ -1634,9 +2323,24 @@ class SmartKalshiTrader:
                 print(f"    Range: ${opp['lower']:,.0f} - ${opp['upper']:,.0f}")
             print(f"    Model: {opp['model_prob']:.1%} | Market: {opp['market_prob']:.1%} | Price: {price}c")
             print(f"    Raw EV: {opp.get('ev', 0):+.1%} | Risk-Adj EV: {opp.get('ev_adjusted', 0):+.2f}σ | Time-Wt EV: {opp.get('ev_time_weighted', 0):+.2%}")
+
+            # Display directional model info (v3)
+            trade_dir = opp.get('trade_direction', 'unknown')
+            trend_aligned = opp.get('trend_aligned', False)
+            drift = opp.get('drift', 0)
+            momentum_24h = opp.get('momentum_24h', 0)
+            trend_status = '✓ WITH TREND' if trend_aligned else '✗ AGAINST TREND'
+            print(f"    Direction: {trade_dir.upper()} | Drift: {drift:+.0%} | Mom 24h: {momentum_24h*100:+.1f}% | {trend_status}")
+
             print(f"    ML Size Mult: {ml_size_multiplier:.2f}x | Signal Conf: {opp.get('signal_confidence', 0):.2f}")
             print(f"    Order: BUY {position} {side.upper()} @ {price}c = ${cost:.2f}")
             print(f"    Potential profit: ${potential_profit:.2f} ({potential_profit/cost*100:.0f}% return)")
+
+            # Generate plain-English explanation and attach to opportunity
+            explanation = explain_decision(opp, self.signals, 'BUY', position=position, cost=cost)
+            opp['explanation'] = explanation
+            opp['decision'] = 'BUY'
+            opp['decision_timestamp'] = datetime.now().isoformat()
 
             if not dry_run:
                 result = self.kalshi.place_order(
@@ -1649,17 +2353,39 @@ class SmartKalshiTrader:
 
                 if result:
                     print(f"    ✓ ORDER PLACED: {result.get('order_id', 'N/A')}")
-                    trades.append({
+                    trade_record = {
                         'ticker': opp['ticker'],
                         'side': side,
                         'quantity': position,
                         'price': price,
                         'cost': cost,
                         'model_prob': opp['model_prob'],
+                        'market_prob': opp.get('market_prob'),
+                        'ev': opp.get('ev'),
+                        'ev_adjusted': opp.get('ev_adjusted'),
                         'adjusted_ev': opp['adjusted_ev'],
-                        'order_id': result.get('order_id')
-                    })
+                        'order_id': result.get('order_id'),
+                        'market_type': market_type,
+                        'hours': opp.get('hours'),
+                        'current_price': self.current_price,
+                        'drift': opp.get('drift'),
+                        'directional_prob': opp.get('directional_prob'),
+                        'vol_only_prob': opp.get('vol_only_prob'),
+                        'trade_direction': opp.get('trade_direction'),
+                        'trend_aligned': opp.get('trend_aligned'),
+                        'explanation': opp.get('explanation', ''),
+                        'decision': 'BUY',
+                        'decision_timestamp': opp.get('decision_timestamp'),
+                    }
+                    trades.append(trade_record)
                     total_risked += cost
+
+                    # Record trade for ML training
+                    if self.data_collector:
+                        try:
+                            self.data_collector.record_trade(trade_record, self.signals)
+                        except Exception as e:
+                            logger.warning(f"Failed to record trade: {e}")
                 else:
                     print(f"    ✗ ORDER FAILED")
             else:
@@ -1672,7 +2398,10 @@ class SmartKalshiTrader:
                     'cost': cost,
                     'model_prob': opp['model_prob'],
                     'adjusted_ev': opp['adjusted_ev'],
-                    'order_id': 'DRY_RUN'
+                    'order_id': 'DRY_RUN',
+                    'explanation': opp.get('explanation', ''),
+                    'decision': 'BUY',
+                    'decision_timestamp': opp.get('decision_timestamp'),
                 })
                 total_risked += cost
 

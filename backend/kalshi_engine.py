@@ -284,11 +284,18 @@ class KalshiEngine:
                 else:
                     logger.info(f"Found crypto market: {title}")
 
-            # Get bid/ask prices
-            yes_bid = market.get('yes_bid', 0)
-            no_bid = market.get('no_bid', 0)
-            yes_ask = market.get('yes_ask', 0)
-            no_ask = market.get('no_ask', 0)
+            # Get bid/ask prices — handle new _dollars suffix (multiply by 100 to get cents scale)
+            def _p(key_dollars, key_old):
+                v = market.get(key_dollars)
+                if v is not None:
+                    try: return round(float(v) * 100)
+                    except: pass
+                return int(market.get(key_old, 0) or 0)
+
+            yes_bid = _p('yes_bid_dollars', 'yes_bid')
+            no_bid  = _p('no_bid_dollars',  'no_bid')
+            yes_ask = _p('yes_ask_dollars', 'yes_ask')
+            no_ask  = _p('no_ask_dollars',  'no_ask')
 
             # Calculate mid prices for display
             yes_price = (yes_bid + yes_ask) / 2 if yes_ask > 0 else yes_bid
@@ -300,9 +307,16 @@ class KalshiEngine:
             elif no_price == 0 and yes_price > 0:
                 no_price = 100 - yes_price
 
-            # Get volume and open interest
-            volume = market.get('volume', 0)
-            open_interest = market.get('open_interest', 0)
+            # Get volume and open interest — handle _fp suffix
+            def _fp(key_fp, key_old):
+                v = market.get(key_fp)
+                if v is not None:
+                    try: return float(v)
+                    except: pass
+                return float(market.get(key_old, 0) or 0)
+
+            volume = _fp('volume_fp', 'volume') or _fp('volume_24h_fp', 'volume_24h')
+            open_interest = _fp('open_interest_fp', 'open_interest')
 
             # Skip markets with very low volume to avoid resting orders (if min_volume set)
             if min_volume > 0 and volume < min_volume:
@@ -365,11 +379,18 @@ class KalshiEngine:
                     if len(all_markets) >= limit:
                         break
 
-                    # Get bid/ask prices
-                    yes_bid = market.get('yes_bid', 0)
-                    no_bid = market.get('no_bid', 0)
-                    yes_ask = market.get('yes_ask', 0)
-                    no_ask = market.get('no_ask', 0)
+                    # Get bid/ask prices — handle new _dollars suffix
+                    def _p2(key_dollars, key_old):
+                        v = market.get(key_dollars)
+                        if v is not None:
+                            try: return round(float(v) * 100)
+                            except: pass
+                        return int(market.get(key_old, 0) or 0)
+
+                    yes_bid = _p2('yes_bid_dollars', 'yes_bid')
+                    no_bid  = _p2('no_bid_dollars',  'no_bid')
+                    yes_ask = _p2('yes_ask_dollars', 'yes_ask')
+                    no_ask  = _p2('no_ask_dollars',  'no_ask')
 
                     # Calculate mid prices
                     yes_price = (yes_bid + yes_ask) / 2 if yes_ask > 0 else yes_bid
@@ -381,8 +402,15 @@ class KalshiEngine:
                     elif no_price == 0 and yes_price > 0:
                         no_price = 100 - yes_price
 
-                    volume = market.get('volume', 0)
-                    open_interest = market.get('open_interest', 0)
+                    def _fp2(key_fp, key_old):
+                        v = market.get(key_fp)
+                        if v is not None:
+                            try: return float(v)
+                            except: pass
+                        return float(market.get(key_old, 0) or 0)
+
+                    volume = _fp2('volume_fp', 'volume') or _fp2('volume_24h_fp', 'volume_24h')
+                    open_interest = _fp2('open_interest_fp', 'open_interest')
 
                     # Skip low volume if filter set
                     if min_volume > 0 and volume < min_volume:
@@ -520,7 +548,14 @@ class KalshiEngine:
         formatted_positions = []
         for pos in positions_list:
             ticker = pos.get('ticker', '')
-            position_value = pos.get('position', 0)
+            # API may return 'position' (int) or 'position_fp' (string fixed-point)
+            position_value = pos.get('position', None)
+            if position_value is None:
+                position_fp = pos.get('position_fp', '0')
+                try:
+                    position_value = float(position_fp)
+                except (ValueError, TypeError):
+                    position_value = 0
 
             # Skip positions with 0 quantity
             if position_value == 0:
@@ -567,22 +602,37 @@ class KalshiEngine:
                     expiry_date = date_str
 
             # Get all available price/cost fields from API
-            # Kalshi uses total_traded (not total_cost) and market_exposure (not market_value)
-            total_traded = pos.get('total_traded', 0)  # in cents
-            market_exposure = pos.get('market_exposure', 0)  # in cents
+            # API may return fields as cents (int) or as '_dollars' strings
+            def _dollars(key):
+                v = pos.get(key + '_dollars', pos.get(key, 0))
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return 0.0
+
+            total_traded_dollars = _dollars('total_traded')   # dollars
+            market_exposure_dollars = _dollars('market_exposure')  # dollars
+            fees_paid_dollars = _dollars('fees_paid')  # dollars
+            realized_pnl_dollars = _dollars('realized_pnl')  # dollars
             resting_orders_count = pos.get('resting_orders_count', 0)
-            fees_paid = pos.get('fees_paid', 0)  # in cents
-            realized_pnl = pos.get('realized_pnl', 0)  # in cents
 
-            # Calculate entry price per contract (in cents)
+            # Convert legacy cent-based fields if they came in as cents (>1 and no _dollars suffix present)
+            # If _dollars suffix was used, values are already in dollars; otherwise divide by 100
+            if pos.get('total_traded_dollars') is None and total_traded_dollars > 1:
+                total_traded_dollars /= 100
+                market_exposure_dollars /= 100
+                fees_paid_dollars /= 100
+                realized_pnl_dollars /= 100
+
+            # Calculate entry price per contract (as fraction 0-1)
             entry_price = 0
-            if position_value != 0 and total_traded != 0:
-                entry_price = total_traded / abs(position_value)
+            if position_value != 0 and total_traded_dollars != 0:
+                entry_price = total_traded_dollars / abs(position_value)
 
-            # Calculate current price per contract (in cents)
+            # Calculate current price per contract (as fraction 0-1)
             current_price = 0
-            if position_value != 0 and market_exposure != 0:
-                current_price = market_exposure / abs(position_value)
+            if position_value != 0 and market_exposure_dollars != 0:
+                current_price = market_exposure_dollars / abs(position_value)
 
             # Get market status fields
             market_status = pos.get('market_status', 'open')
@@ -593,13 +643,13 @@ class KalshiEngine:
                 'quantity': abs(position_value),
                 'side': side,
                 'strike': strike,
-                'entry_price': entry_price,  # cents per contract
-                'current_price': current_price,  # cents per contract
-                'total_cost': total_traded / 100,  # dollars
-                'current_value': market_exposure / 100,  # dollars
-                'pnl': (market_exposure - total_traded) / 100,  # dollars
-                'fees_paid': fees_paid / 100,  # dollars
-                'realized_pnl': realized_pnl / 100,  # dollars
+                'entry_price': entry_price,
+                'current_price': current_price,
+                'total_cost': total_traded_dollars,
+                'current_value': market_exposure_dollars,
+                'pnl': market_exposure_dollars - total_traded_dollars,
+                'fees_paid': fees_paid_dollars,
+                'realized_pnl': realized_pnl_dollars,
                 'resting_orders': resting_orders_count,
                 'status': market_status,
                 'expiry': expiry_date

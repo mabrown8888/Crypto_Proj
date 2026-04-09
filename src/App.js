@@ -1,35 +1,39 @@
 import React, { useState, useEffect } from 'react';
 import {
   Activity,
-  TrendingUp,
   TrendingDown,
   Bot,
   Mic,
   MicOff,
   Bell,
   DollarSign,
-  BarChart3,
   Settings,
   History,
-  LogOut
+  LogOut,
+  BarChart2
 } from 'lucide-react';
+import CoinbaseBotDashboard from './components/CoinbaseBotDashboard';
 import Portfolio from './components/Portfolio';
-import Trade from './components/Trade';
 import VoiceCommands from './components/VoiceCommands';
 import BotStatus from './components/BotStatus';
 import TradingHistory from './components/TradingHistory';
 import NotificationsModal from './components/NotificationsModal';
 import SettingsModal from './components/SettingsModal';
 import LoginForm from './components/LoginForm';
-import EnhancedAutoTradingBot from './components/EnhancedAutoTradingBot';
-import KalshiDashboard from './components/KalshiDashboard';
 import HedgeDashboard from './components/HedgeDashboard';
 import BTCMonitor from './components/BTCMonitor';
 import AlgorithmAnalytics from './components/AlgorithmAnalytics';
 import { authUtils, setupTokenRefresh } from './utils/auth';
 
+const ANALYTICS_SUB_TABS = [
+  { id: 'history', label: 'Trading History', icon: History },
+  { id: 'btc', label: 'BTC Monitor', icon: Activity },
+  { id: 'algo', label: 'Algorithm Analytics', icon: BarChart2 },
+];
+
 function App() {
   const [activeTab, setActiveTab] = useState('portfolio');
+  const [analyticsSubTab, setAnalyticsSubTab] = useState('history');
   const [botConnected] = useState(false);
   const [voiceActive, setVoiceActive] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -67,35 +71,48 @@ function App() {
 
   const tabs = [
     { id: 'portfolio', name: 'Portfolio', icon: DollarSign },
-    { id: 'trade', name: 'Trade', icon: BarChart3 },
-    { id: 'auto-trading', name: 'Coinbase Trading Bot', icon: Bot },
-    { id: 'history', name: 'Trading History', icon: History },
-    { id: 'kalshi', name: 'Kalshi Markets', icon: TrendingUp },
-    { id: 'btc-monitor', name: 'BTC Monitor', icon: Activity },
+    { id: 'coinbase-bot', name: 'Coinbase Bot', icon: Bot },
     { id: 'hedge', name: 'Kalshi Trading Bot', icon: TrendingDown },
-    { id: 'analytics', name: 'Algorithm Analytics', icon: Activity },
+    { id: 'analytics', name: 'Analytics', icon: BarChart2 },
   ];
+
+  const renderAnalyticsSubTab = () => {
+    switch (analyticsSubTab) {
+      case 'history': return <TradingHistory />;
+      case 'btc':     return <BTCMonitor />;
+      case 'algo':    return <AlgorithmAnalytics />;
+      default:        return <TradingHistory />;
+    }
+  };
 
   const renderActiveComponent = () => {
     switch (activeTab) {
-      case 'portfolio':
-        return <Portfolio />;
-      case 'trade':
-        return <Trade />;
-      case 'auto-trading':
-        return <EnhancedAutoTradingBot />;
-      case 'history':
-        return <TradingHistory />;
-      case 'kalshi':
-        return <KalshiDashboard />;
-      case 'btc-monitor':
-        return <BTCMonitor />;
-      case 'hedge':
-        return <HedgeDashboard />;
+      case 'portfolio':    return <Portfolio />;
+      case 'coinbase-bot': return <CoinbaseBotDashboard />;
+      case 'hedge':        return <HedgeDashboard />;
       case 'analytics':
-        return <AlgorithmAnalytics />;
-      default:
-        return <Portfolio />;
+        return (
+          <div>
+            <div className="flex space-x-1 mb-6 border-b border-gray-700">
+              {ANALYTICS_SUB_TABS.map(({ id, label, icon: Icon }) => (
+                <button
+                  key={id}
+                  onClick={() => setAnalyticsSubTab(id)}
+                  className={`flex items-center space-x-2 px-4 py-2 text-sm font-medium transition-all border-b-2 -mb-px ${
+                    analyticsSubTab === id
+                      ? 'text-crypto-blue border-crypto-blue'
+                      : 'text-gray-400 border-transparent hover:text-gray-200'
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  <span>{label}</span>
+                </button>
+              ))}
+            </div>
+            {renderAnalyticsSubTab()}
+          </div>
+        );
+      default: return <Portfolio />;
     }
   };
 
